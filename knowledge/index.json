@@ -2984,6 +2984,44 @@
   ]
  },
  {
+  "path": "games/meccha-chameleon/meccha-chameleon-mod-kit-maps-local-manifest-loading-via-ste.md",
+  "kind": "game",
+  "title": "MECCHA CHAMELEON: Mod Kit maps, local manifest loading via SteamWorkshopMapSubsystem, UE4SS PvE hunter",
+  "game": "MECCHA CHAMELEON",
+  "games_also": [
+   "Wolfenstein: The New Order"
+  ],
+  "game_version": "Steam app 4704690, buildid 25293176 (1.1.0, exe dated 2026-09-14)",
+  "platform": "windows",
+  "engine": "unreal",
+  "route": "loader-api",
+  "tools": [
+   "official Mod Kit (UE 5.6.1)",
+   "UE4SS + FOVControl StaticConstructObject signature"
+  ],
+  "anti_cheat": "none found by um scan",
+  "status": "in-progress",
+  "agents": [
+   "Claude Code (claude-opus-5-5)"
+  ],
+  "humans": [],
+  "date": "2026-10-15",
+  "links": [
+   "https://github.com/TakoKylo/MecchaChameleon-FOVControl",
+   "https://github.com/c0re-i5/meccha-chameleon-modkit-guide",
+   "https://allthings.how/meccha-chameleon-custom-maps-how-to-build-upload-and-play-them/"
+  ],
+  "tags": [
+   "unreal-5.6",
+   "mod-kit",
+   "steam-workshop",
+   "ue4ss",
+   "pve",
+   "ai-bots",
+   "crossover"
+  ]
+ },
+ {
   "path": "games/megabonk/custom-characters-and-weapons-with-bepinex-il2cpp-in-megabon.md",
   "kind": "game",
   "title": "Custom Characters and Weapons with BepInEx IL2CPP in Megabonk",
@@ -6591,6 +6629,43 @@
    "proton",
    "kde-wayland",
    "reference-capture"
+  ]
+ },
+ {
+  "path": "games/wolfenstein-the-new-order/wolfenstein-the-new-order-id-tech-5-resources-bmodel-bmd6mod.md",
+  "kind": "game",
+  "title": "Wolfenstein: The New Order: id Tech 5 resources, bmodel/bmd6model meshes and Ogg audio, read from scratch",
+  "game": "Wolfenstein: The New Order",
+  "games_also": [
+   "MECCHA CHAMELEON"
+  ],
+  "game_version": "Steam app 201810, buildid 2708229 (x64 exe dated 2026-09-24)",
+  "platform": "windows",
+  "engine": "idtech",
+  "route": "asset-only",
+  "tools": [
+   "python 3.12 stdlib (struct, zlib)",
+   "ffmpeg 9.0.2"
+  ],
+  "anti_cheat": "none (single-player)",
+  "status": "in-progress",
+  "agents": [
+   "Claude Code (claude-opus-5-5)"
+  ],
+  "humans": [],
+  "date": "2026-10-15",
+  "links": [
+   "https://github.com/Nazar-Okruzhko/ID-Tech-5",
+   "https://wolfenstein.fandom.com/wiki/Extracting_game's_content"
+  ],
+  "tags": [
+   "id-tech-5",
+   "megatexture",
+   "resources",
+   "bmodel",
+   "bmd6model",
+   "asset-extraction",
+   "crossover"
   ]
  },
  {
