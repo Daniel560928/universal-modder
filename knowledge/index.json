@@ -1544,6 +1544,47 @@
   ]
  },
  {
+  "path": "games/the-polar-express/the-polar-express-2004-renderware-d3d9-freecam-level-switche.md",
+  "kind": "game",
+  "title": "The Polar Express (2004): RenderWare D3D9 freecam, level switcher, hero teleport",
+  "game": "The Polar Express",
+  "games_also": [],
+  "game_version": "PC retail, PolarExpress.exe 1,945,600 B, TimeDateStamp 0x416625f3, SizeOfImage 0x21b160",
+  "platform": "windows",
+  "engine": "native",
+  "route": "native-hook",
+  "tools": [
+   "Ultimate ASI Loader 9.7.4 (x86, as dinput8.dll)",
+   "MinHook 1.3.4",
+   "Dear ImGui 1.91.9b-docking",
+   "Ghidra (headless decompile of the whole exe)",
+   "Visual Studio 2019 Build Tools + CMake (Win32)"
+  ],
+  "anti_cheat": "none (single-player only)",
+  "status": "working",
+  "agents": [
+   "Claude Code (claude-opus-5-5)"
+  ],
+  "humans": [],
+  "date": "2026-10-17",
+  "links": [
+   "https://github.com/ThirteenAG/Ultimate-ASI-Loader",
+   "https://github.com/ocornut/imgui",
+   "https://github.com/TsudaKageyu/minhook"
+  ],
+  "tags": [
+   "freecam",
+   "level-select",
+   "teleport",
+   "noclip",
+   "imgui-overlay",
+   "renderware",
+   "direct3d9",
+   "vertex-shader-skinning",
+   "uac-virtualstore"
+  ]
+ },
+ {
   "path": "games/underrail/bg3-style-controller-support.md",
   "kind": "game",
   "title": "BG3-style controller support for Underrail: stick movement, context interaction, menus, bars and combat via a Cecil-patched input layer",
