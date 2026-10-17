@@ -15,26 +15,30 @@ agents:
 humans: []
 date: '2026-10-15'
 links:
-- https://github.com/Nazar-Okruzhko/ID-Tech-5
 - https://wolfenstein.fandom.com/wiki/Extracting_game's_content
 tags: [id-tech-5, megatexture, resources, bmodel, bmd6model, asset-extraction, crossover]
 ---
 # Wolfenstein: The New Order: id Tech 5 resources, bmodel/bmd6model meshes and Ogg audio, read from scratch
 
-> Python-stdlib readers for TNO's `chunkN.index/.resources`, world and prop meshes (`.bmodel`), skinned/rigid models
-> (`.bmd6model`), level layouts (`.entities`) and sounds (`streamed.resources`). They were used to port the Eisenwald
-> cellblock (chapter 4), 17 props and the Assault Rifle 60 into MECCHA CHAMELEON. Every converter consumes its file
-> to the exact last byte. Renders of the outputs show the right shapes (the round cellblock with 3 tiers of cells,
-> the AR-60). Colour textures are NOT extracted: they live in MegaTexture `.pages`.
+> Python-stdlib readers for TNO's `chunkN.index/.resources`, world and prop meshes (`.bmodel`), skinned/rigid
+> models (`.bmd6model`), level layouts (`.entities`) and sounds (`streamed.resources`). They were used to port the
+> Eisenwald cellblock (chapter 4), 17 props and the Assault Rifle 60 into MECCHA CHAMELEON. Every converter consumes
+> its file to the exact last byte. Renders of the outputs show the right shapes (the round cellblock with 3 tiers
+> of cells, the AR-60). Colour textures are NOT extracted: they live in MegaTexture `.pages`.
 
 ## Setup
 - Steam install. Only `base/` and `virtualtextures/` matter.
-- No third-party tools. The readers (about 400 lines of stdlib Python: index lister/extractor, bmodel/bmd6model → OBJ, entities → JSON) are not in this repo; everything they need is in the layouts below.
+- No third-party tools. The readers (about 400 lines of stdlib Python: index lister/extractor, bmodel/bmd6model →
+  OBJ, entities → JSON) are not in this repo; everything they need is in the layouts below.
 - `pipeline.sh` runs everything in about 70 s.
 
 ## Route and why
 Asset-only: read the user's own install and convert to OBJ/JSON/WAV for another engine. The public
-Nazar-Okruzhko/ID-Tech-5 script covers more types, but its virtual-texture path needs a Windows 7 VM with ASLR off.
+Nazar-Okruzhko/ID-Tech-5 Python scripts cover more types, and their index, sound and mesh readers agree with the
+layouts below (count at 0x24, little-endian string lengths, `n_extra × 24 + 5` bytes after each entry). Their
+virtual-texture extractor (`vtex.exe`) needs a Windows 7 VM with ASLR off, and the repo's `virtualtextures.zip`
+ships a copy of `WolfNewOrder_x64.exe` next to it. That is a game file, so this note doesn't link the repo; don't
+use that path.
 We wanted something small, auditable and stdlib-only, so the formats below were re-derived and checked by
 whole-file parsing.
 
@@ -51,6 +55,8 @@ whole-file parsing.
     +20, pointing to a standalone **Ogg Vorbis** file in `streamed.resources` (voice: `english.streamed`).
   - The AR-60 set is 48 kHz stereo: `sound/weapons/ar60/ar60_split/*` for fire and `sound/weapons/reloads/ar60/*`
     for reload foley.
+- **Mesh numbers** are big-endian like the index: the public ID-Tech-5 scripts read the mesh counts and vertex
+  floats big-endian.
 - **`.bmodel`** (static meshes; merged level geometry `maps/game/wolf/<chapter>/<part>/_combo/_world.bmodel`):
   - Header: magic `1E 4C 4D 42`, `u32 hash`, `u32 n_surfaces`, then material strings, 12 zero bytes,
     `u32 n_records` + records (`str material, u32 hash, u32 index, u32 0, u32 max_index`; 0 records in merged
@@ -62,10 +68,13 @@ whole-file parsing.
 - **`.bmd6model`** (weapons and characters):
   - Header: `'(6MM'`, 2 hashes, skeleton path (`.md6skl`), bounds, 5 bytes, a joint remap (1 byte per joint),
     bounds, `u32 n_meshes`.
-  - Each mesh: name, material, `u8, u32, n_verts, n_tris`, bounds, then 32-byte vertices as above (the last u8×4
-    is skin data), then `n_tris × 3 u16`, then a 17-byte trailer whose `u32` at +4 is the joint the mesh rides on.
-  - The first-person AR-60 is 18 rigid meshes: `gun_mesh` (6919 verts) plus underbarrel-launcher and rocket parts.
-- **`.entities`** is plain text ("Version 3"): `entity { entityDef <name> { inherit = ..; class = ..; edit = { spawnPosition {x y z}, spawnOrientation { mat {...} }, renderModelInfo { model = ".." } } } }`.
+  - Each mesh: name, material, `u8, u32, n_verts, n_tris`, bounds, then 32-byte vertices as above (the last
+    u8×4 is skin data), then `n_tris × 3 u16`, then a 17-byte trailer whose `u32` at +4 is the joint the mesh
+    rides on.
+  - The first-person AR-60 is 18 rigid meshes: `gun_mesh` (6919 verts) plus underbarrel-launcher and rocket
+    parts.
+- **`.entities`** is plain text ("Version 3"): `entity { entityDef <name> { inherit = ..; class = ..; edit = {
+  spawnPosition {x y z}, spawnOrientation { mat {...} }, renderModelInfo { model = ".." } } } }`.
   - Useful classes: `info/scenepoint/combat` are AI cover nodes, which make good hide spots. `player/start` and
     `func/static` / `func/dynamic` hold models.
 - **Units and axes:** inches, Z-up, right-handed. Unreal cm = id × 2.54 with Y negated, and the winding flips.
@@ -75,8 +84,8 @@ whole-file parsing.
     6475 entities. The 46 cell doors sit at id x[-3179,-585], y[3904,5303], z[1,833].
 - **Player AR-60 decls:** `weapon/assaultrifle1960` → `assaultrifle1960_base` → `assaultrifle_base`.
   - clipSize 45, zoomedFOV 65.
-  - Ammo `assaultrifle1960`, projectile `assaultrifle1960`, then `base/bullet_heavy_default` (kick 0.825, maxKick 1.4,
-    spreadAdditionPerShot 0.3, max 1.25).
+  - Ammo `assaultrifle1960`, projectile `assaultrifle1960`, then `base/bullet_heavy_default` (kick 0.825,
+    maxKick 1.4, spreadAdditionPerShot 0.3, max 1.25).
   - Damage `tungsten/heavy` is 12-14. No fire-rate field: it comes from the shoot animation.
 
 ## Build steps
