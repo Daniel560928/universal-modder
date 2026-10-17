@@ -51,7 +51,9 @@ Without a clone, OpenCode 2 installs the plugin in `plugins/opencode/` with `ope
 fal MCP server when `FAL_KEY` is set and none is configured. A clone doesn't need it. See
 `plugins/opencode/README.md`.
 
-**The `um` CLI.** Plugin installs and clones put it on PATH (OpenCode's plugin install doesn't). Anywhere else:
+**The `um` CLI.** The Claude Code plugin puts it on PATH (its SessionStart hook), and so does a clone opened in
+Claude Code (`.claude/settings.json`); in a clone with another agent, `export PATH="$PWD/bin:$PATH"`. Other
+agents' plugin installs (Codex, Cursor, Gemini CLI, OpenCode) don't, so install it once:
 ```bash
 uv tool install git+https://github.com/rehan-remade/universal-modder     # or: pipx install git+...
 ```

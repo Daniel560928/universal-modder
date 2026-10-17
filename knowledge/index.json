@@ -2723,6 +2723,67 @@
   ]
  },
  {
+  "path": "games/insaniquarium-deluxe/an-android-port-of-insaniquarium-deluxe-from-the-winfish-decompilation.md",
+  "kind": "game",
+  "title": "An Android port of Insaniquarium Deluxe from the WinFish decompilation on PopLib (SDL3), widescreen for a foldable and a tablet",
+  "game": "Insaniquarium Deluxe",
+  "games_also": [],
+  "game_version": "Steam app 3320, Insaniquarium.exe md5 1314be36cbd1d79a6816c48b273a5b22 (decomp targets 1.1); assets from the user's own copy",
+  "platform": "other",
+  "engine": "native",
+  "route": "decomp-recomp",
+  "tools": [
+   "Vindirect/WinFish decompilation (61ddba1)",
+   "SaMeiers/insaniquarium-port (AGPL-3.0, 95d4aaf)",
+   "SaMeiers/PopLib fork (SDL3 rewrite of SexyAppFramework, 45776ce)",
+   "libopenmpt 0.8.9",
+   "Android NDK r27d (27.3.13750724)",
+   "Android SDK cmdline-tools 23.0 / android CLI",
+   "CMake 4.1.2",
+   "Gradle 8.12 + AGP 8.7.3",
+   "JDK 22",
+   "Visual Studio 2022 (desktop test build)",
+   "Qwen-Image-Edit 2509 fp8 + Lightning 8-step LoRA in ComfyUI 0.24 (wide art)"
+  ],
+  "anti_cheat": "none (offline single-player game)",
+  "status": "in-progress",
+  "agents": [
+   "Claude Code (Opus 5.5)"
+  ],
+  "humans": [],
+  "date": "2026-10-16",
+  "links": [
+   "https://github.com/vindirect/winfish",
+   "https://github.com/SaMeiers/insaniquarium-port",
+   "https://github.com/SaMeiers/PopLib",
+   "https://github.com/teampopwork/poplib",
+   "https://lib.openmpt.org/libopenmpt/"
+  ],
+  "tags": [
+   "android",
+   "apk",
+   "popcap",
+   "sexyapp",
+   "sexyappframework",
+   "poplib",
+   "sdl3",
+   "decompilation",
+   "native-port",
+   "touch",
+   "lifecycle",
+   "ndk",
+   "headless-testing",
+   "widescreen",
+   "aspect-ratio",
+   "foldable",
+   "galaxy-z-fold7",
+   "tablet",
+   "galaxy-tab-s11-ultra",
+   "outpainting",
+   "qwen-image-edit"
+  ]
+ },
+ {
   "path": "games/just-cause-3/vehicle-mesh-editing-added-geometry-loads-with-matching-toc.md",
   "kind": "game",
   "title": "Vehicle mesh editing: added geometry loads with a matching .ee.toc",
@@ -3142,6 +3203,60 @@
   ]
  },
  {
+  "path": "games/middle-earth-shadow-of-war/falmer-tribe-a-skyrim-creature-as-a-nemesis-tribe.md",
+  "kind": "game",
+  "title": "Falmer tribe: a Skyrim creature imported as a Nemesis tribe (mesh conform, MMSH/texture/bundle format, body-replacement items, corpse + Garrison fix)",
+  "game": "Middle-earth: Shadow of War",
+  "games_also": [
+   "The Elder Scrolls V: Skyrim Special Edition"
+  ],
+  "game_version": "Steam build 3095001 (public branch, unchanged since 2018-09-05), Windows 10 22H2; Skyrim SE (Steam) as the asset source",
+  "platform": "windows",
+  "engine": "unknown",
+  "route": "data",
+  "tools": [
+   "Blender 3.6.23 + blender_niftools_addon 0.1.1 (NIF import)",
+   "Blender 4.2.3 (conform script, headless)",
+   "Python 3.12 + numpy (own MMSH/.tex/.bndl/.arch06 tools, BSA reader)",
+   "custom C# gamedb/strdb reader-writer (PowerShell Add-Type)",
+   "QuickBMS + aluigi shadow_of_mordor.bms 0.4",
+   "Ghidra 12.1.4 (headless, analysis only)"
+  ],
+  "anti_cheat": "none; loose data + an extra archive, exe untouched. All testing ran offline through the offline-mode DLL and its local Garrison (never signed in to WB).",
+  "status": "in-progress",
+  "agents": [
+   "Claude Code (Opus 5.5)"
+  ],
+  "humans": [
+   "DeimozZarco"
+  ],
+  "date": "2026-10-15",
+  "links": [
+   "knowledge/games/middle-earth-shadow-of-war/goblin-tribe-a-new-nemesis-tribe-via-game-gamedb.md",
+   "knowledge/games/middle-earth-shadow-of-war/offline-mode-and-local-garrison.md",
+   "https://github.com/niftools/blender_niftools_addon"
+  ],
+  "tags": [
+   "nemesis",
+   "tribe",
+   "creature-import",
+   "skyrim",
+   "falmer",
+   "mmsh",
+   "mesh",
+   "skinning",
+   "textures",
+   "tex0",
+   "bundles",
+   "archive",
+   "gamedb",
+   "garrison",
+   "corpse",
+   "ragdoll",
+   "body-replacement"
+  ]
+ },
+ {
   "path": "games/middle-earth-shadow-of-war/goblin-tribe-a-new-nemesis-tribe-via-game-gamedb.md",
   "kind": "game",
   "title": "Goblins of War: a new Nemesis tribe added by rebuilding game.gamedb (format, hashes, sort rule, role-to-tribe)",
@@ -3228,6 +3343,91 @@
    "binary-protocol",
    "reverse-engineering",
    "testing-prerequisite"
+  ]
+ },
+ {
+  "path": "games/middle-earth-shadow-of-war/packet-loader-mods-without-packet-loader.md",
+  "kind": "game",
+  "title": "Packet Loader mods without Packet Loader: rewrite the newest .bndl load lists (cosmetics: no quiver, no sheaths, lightweight armour, mace replacer, no cloak/hood)",
+  "game": "Middle-earth: Shadow of War",
+  "games_also": [],
+  "game_version": "Steam build 3095001 (public branch, unchanged since 2018-09-05), Windows 10 22H2",
+  "platform": "windows",
+  "engine": "unknown",
+  "route": "asset-only",
+  "tools": [
+   "Python 3.12 (own .bndl/.embb reader-writer)",
+   "QuickBMS + aluigi shadow_of_mordor.bms 0.4 (extraction)",
+   "Pillow (texture upscale for .texuhd)"
+  ],
+  "anti_cheat": "none; loose data files only, the exe is untouched. Tested offline with the offline-mode DLL.",
+  "status": "working",
+  "agents": [
+   "Claude Code (Opus 5.5)"
+  ],
+  "humans": [
+   "DeimozZarco"
+  ],
+  "date": "2026-10-15",
+  "links": [
+   "https://www.nexusmods.com/middleearthshadowofwar/mods/49",
+   "https://www.nexusmods.com/middleearthshadowofwar/mods/166",
+   "https://www.nexusmods.com/middleearthshadowofwar/mods/168",
+   "https://www.nexusmods.com/middleearthshadowofwar/mods/170",
+   "https://www.nexusmods.com/middleearthshadowofwar/mods/128",
+   "knowledge/games/middle-earth-shadow-of-war/offline-mode-and-local-garrison.md",
+   "knowledge/games/middle-earth-shadow-of-war/goblin-tribe-a-new-nemesis-tribe-via-game-gamedb.md"
+  ],
+  "tags": [
+   "packet-loader",
+   "bundles",
+   "bndl",
+   "embb",
+   "cosmetics",
+   "talion",
+   "conversion",
+   "loose-files",
+   "archcfg",
+   "no-dll"
+  ]
+ },
+ {
+  "path": "games/middle-earth-shadow-of-war/save-format-decrypt-and-collectible-quests.md",
+  "kind": "game",
+  "title": "Save files: SOM3 decryption (AES-256-CBC) and marking collectible quest lines complete",
+  "game": "Middle-earth: Shadow of War",
+  "games_also": [],
+  "game_version": "Steam build 3095001 (public branch, unchanged since 2018-09-05), Windows 10 22H2",
+  "platform": "windows",
+  "engine": "unknown",
+  "route": "data",
+  "tools": [
+   "Python 3.12 + cryptography (AES-CBC)",
+   "Ghidra 12.1.4 (headless, analysis only)"
+  ],
+  "anti_cheat": "none; single-player save file edited offline (the game ran with the offline-mode DLL from the earlier note). Load edited saves only offline, never signed in to WB. Back up both save copies first.",
+  "status": "working",
+  "agents": [
+   "Claude Code (Opus 5.5)"
+  ],
+  "humans": [
+   "DeimozZarco"
+  ],
+  "date": "2026-10-15",
+  "links": [
+   "knowledge/games/middle-earth-shadow-of-war/goblin-tribe-a-new-nemesis-tribe-via-game-gamedb.md",
+   "knowledge/games/middle-earth-shadow-of-war/offline-mode-and-local-garrison.md"
+  ],
+  "tags": [
+   "save-edit",
+   "encryption",
+   "aes",
+   "crc32",
+   "quests",
+   "collectibles",
+   "inventory",
+   "chunks",
+   "reverse-engineering"
   ]
  },
  {
