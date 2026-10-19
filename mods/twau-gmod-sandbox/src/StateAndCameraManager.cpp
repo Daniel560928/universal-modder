@@ -712,6 +712,7 @@ std::vector<std::string> ConsoleCommand(lua::State* L, const std::string& line) 
                "spawn <name>      spawn a character as an NPC (part of its name or prop)",
                "lookat [agent]    aim at an agent (default: the last spawn)",
                "ai [agent] stay|wander|follow   what a spawned NPC does (default: the last spawn)",
+               "pose emotion <name> | mouth <shape> [w] | fingers <curl...>   face and finger poser (the last spawn)",
                "noclip | god | thirdperson | giveammo",
                "gm_measure        distance between the first two characters (units check)",
                "gm_calibrate      redo the camera axis calibration"};
@@ -796,6 +797,41 @@ std::vector<std::string> ConsoleCommand(lua::State* L, const std::string& line) 
             e->ai = mode;
             e->aiTimer = 0;
             out.push_back(e->name + ": " + b);
+        }
+    } else if (cmd == "pose") {
+        // pose emotion <name> | mouth <shape> [weight] | fingers <curl...>: the Face & Finger Poser on the last
+        // spawn, from the console (tests and binds). Curls repeat per hand: thumb, index, middle, ring, pinky.
+        std::istringstream ps(rest);
+        std::string what, arg;
+        ps >> what >> arg;
+        Entity* e = nullptr;
+        for (auto& x : w.ents)
+            if (x->spawned) e = x.get();
+        if (!e || !e->info) {
+            out.push_back("no spawned character");
+        } else if (what == "emotion") {
+            combat::SetEmotion(L, e, arg);
+            out.push_back(e->name + " emotion: " + (e->emotion.empty() ? "none" : e->emotion));
+        } else if (what == "mouth") {
+            float wgt = 1.0f;
+            ps >> wgt;
+            combat::SetMouth(L, e, arg, wgt);
+            out.push_back(e->name + " mouth: " + (e->mouthHandle >= 0 ? e->mouthShape : "none"));
+        } else if (what == "fingers") {
+            if (e->fingerHands < 0) combat::BuildFingers(e);
+            std::vector<float> curl;
+            if (!arg.empty()) curl.push_back((float)atof(arg.c_str()));
+            for (float v; ps >> v;) curl.push_back(v);
+            for (size_t f = 0; !curl.empty() && f < e->fingerCurl.size(); ++f) e->fingerCurl[f] = curl[f % curl.size()];
+            combat::ApplyFingers(e);
+            out.push_back(e->name + ": " + std::to_string(e->fingerCurl.size()) + " fingers");
+        } else {
+            std::string em, sh;
+            for (auto& x : e->info->emotions) em += x + " ";
+            for (auto& x : combat::MouthShapes(e->info->facePrefix)) sh += x + " ";
+            out.push_back("emotions: " + em);
+            out.push_back("mouths: " + sh);
+            out.push_back("pose emotion <name> | mouth <shape> [weight] | fingers <curl...>");
         }
     } else if (cmd == "skel") {
         // skel [vtable rva]: live objects with that vtable (default SkeletonInstance, RTTI .?AVSkeletonInstance@@)

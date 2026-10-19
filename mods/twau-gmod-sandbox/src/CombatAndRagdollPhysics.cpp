@@ -3,9 +3,11 @@
 // verlet ragdolls for the dead, and NPC locomotion that picks biped or quadruped clips from the catalog.
 #include <algorithm>
 #include <atomic>
+#include <map>
 #include <mutex>
 #include <random>
 #include <thread>
+#include <unordered_map>
 
 #include <MinHook.h>
 
@@ -158,8 +160,26 @@ struct Ragdoll {
     float restTimer = 0;
     float radius = 0;        // particles stay this far above the floor
     float stepClock = 0;     // fixed 120 Hz steps: verlet and the solver want a steady dt
-    int pinned = -1;
-    bool restorePose = false;  // a story character's: put its bones back when the ragdoll goes         // held by the physgun this frame: constraints don't move it
+    // The physgun's grip: particle `grab` is pulled to grabTarget every step and constraints don't move it.
+    // As in GMod the gripped piece keeps its orientation (turning with the player's yaw): the bone and the two
+    // that orient it are held, at grabOff from the grip; the rest of the body hangs off that piece.
+    int grab = -1;
+    Vec3 grabTarget;
+    std::vector<int> grabSet;      // grab, frameA[grab], frameB[grab]
+    std::vector<Vec3> grabOff;     // world offsets from the grip at the time of the grab (E turns them)
+    std::vector<Vec3> grabTargets; // where each one goes this frame
+    void Grip(int i) {
+        grab = i;
+        grabSet.clear();
+        grabOff.clear();
+        for (int k : {i, frameA[i], frameB[i]})
+            if (k >= 0) { grabSet.push_back(k); grabOff.push_back(p[k].x - p[i].x); }
+        grabTargets.assign(grabSet.size(), p[i].x);
+    }
+    void Release() { grab = -1; grabSet.clear(); }
+    bool restorePose = false;  // a story character's: put its bones back when the ragdoll goes
+    std::vector<float> mass;   // kg per particle (skeletal)
+    std::vector<float> floorPush;  // scratch: how far the floor pushed each particle this step
 
     // per-bone mode
     bool skeletal = false;
@@ -341,6 +361,25 @@ struct Ragdoll {
             bool axial = up > -0.05f * upm && Length(off - U * up) < 0.12f * upm;
             segs.push_back({i, a, (axial ? 0.11f : len > 0.3f * upm ? 0.06f : 0.05f) * upm});
         }
+        // Mass per bone, roughly a 75 kg body: the trunk is heavy, limb bones weigh by their length, and the
+        // short ones (fingers, face, twist helpers) almost nothing. With equal masses the 15 finger bones made
+        // a hand outweigh the chest and the face bones made the head a lead ball.
+        mass.assign(count, 0.05f);
+        for (int i = 0; i < count; ++i) {
+            int a = frameA[i];
+            float len = a < 0 ? 0 : Length(deathP[a] - deathP[i]) / upm;
+            Vec3 off = deathP[i] - pel;
+            float up = Dot(off, U);
+            bool axial = up > -0.05f * upm && Length(off - U * up) < 0.12f * upm;
+            if (len >= 0.06f) mass[i] = axial ? 5 + 20 * len : 12 * len;
+        }
+        mass[pelvis] = std::max(mass[pelvis], 10.0f);
+        // A light bone between heavy ones (a twist helper in the arm) would let the limb stretch: at least 1 kg
+        // for every bone with a heavy bone below it.
+        for (int pass = 0; pass < 8; ++pass)
+            for (int i = 0; i < count; ++i)
+                if (parent[i] >= 0 && mass[i] >= 1.0f) mass[parent[i]] = std::max(mass[parent[i]], 1.0f);
+        for (int i = 0; i < count; ++i) p[i].invMass = 1.0f / mass[i];
         for (size_t x = 0; x < segs.size(); ++x)
             for (size_t y = x + 1; y < segs.size(); ++y) {
                 const Seg &s1 = segs[x], &s2 = segs[y];
@@ -366,26 +405,41 @@ struct Ragdoll {
             float d = Length(p[i].x - at);
             if (d < bd) { bd = d; best = (int)i; }
         }
-        float reach = 0.5f * GetWorld().axes.unitsPerMeter;
-        for (size_t i = 0; i < p.size(); ++i) {
-            float k = skeletal ? std::max(0.35f, 1.0f - Length(p[i].x - p[best].x) / reach)
-                               : ((int)i == best ? 1.0f : 0.35f);
-            p[i].old -= dv * (k * kStep);  // verlet: velocity is (x - old) / step
+        float reach = 0.35f * GetWorld().axes.unitsPerMeter;
+        if (skeletal && !mass.empty()) {
+            // A hit is momentum (dv as if it hit 40 kg) given to the bones within reach, weighted by mass: a
+            // shot to the chest knocks the trunk back and the arms lag and fly up, as in Source.
+            std::vector<float> k(p.size(), 0.0f);
+            float m = 0;
+            for (size_t i = 0; i < p.size(); ++i) {
+                k[i] = std::max(0.0f, 1.0f - Length(p[i].x - p[best].x) / reach);
+                m += k[i] * mass[i];
+            }
+            if (m <= 0) return;
+            Vec3 dvLocal = dv * (40.0f / m);
+            for (size_t i = 0; i < p.size(); ++i)
+                if (k[i] > 0) p[i].old -= dvLocal * (k[i] * kStep);  // verlet: velocity is (x - old) / step
+        } else {
+            for (size_t i = 0; i < p.size(); ++i) p[i].old -= dv * (((int)i == best ? 1.0f : 0.35f) * kStep);
         }
         restTimer = 0;
     }
 
     void Step(float dt, const Axes& ax, float groundY) {
-        float pinnedMass = 0;
-        if (pinned >= 0) std::swap(pinnedMass, p[pinned].invMass);
+        float grabMass[3] = {};
+        for (size_t k = 0; k < grabSet.size(); ++k) std::swap(grabMass[k], p[grabSet[k]].invMass);
         Vec3 g = ax.up * (-9.8f * ax.unitsPerMeter * dt * dt);
-        for (auto& q : p) {
-            Vec3 v = (q.x - q.old) * 0.995f;
+        for (size_t i = 0; i < p.size(); ++i) {
+            P& q = p[i];
+            Vec3 v = (q.x - q.old) * (std::find(grabSet.begin(), grabSet.end(), (int)i) != grabSet.end() ? 0.5f : 0.998f);
             float vmax = 12.0f * ax.unitsPerMeter * dt, vl = Length(v);  // a hard physgun swing still lands nearby
             if (vl > vmax) v *= vmax / vl;
             q.old = q.x;
             q.x += v + g;
         }
+        // The grip is a stiff spring, not a teleport: the gripped bone keeps a velocity, so the body swings.
+        for (size_t k = 0; k < grabSet.size(); ++k) p[grabSet[k]].x += (grabTargets[k] - p[grabSet[k]].x) * 0.35f;
+        floorPush.assign(p.size(), 0.0f);
         float floor = groundY + radius;
         for (int it = 0; it < (skeletal ? 12 : 10); ++it) {
             for (auto& k : c) {
@@ -440,17 +494,26 @@ struct Ragdoll {
                     p[h.p].x += bd * (side * wp / (wi + wp));
                 }
             }
-            for (auto& q : p) {  // floor with friction
-                float h = Dot(q.x, ax.up) - floor;
+            for (size_t i = 0; i < p.size(); ++i) {  // floor
+                float h = Dot(p[i].x, ax.up) - floor;
                 if (h < 0) {
-                    q.x -= ax.up * h;
-                    Vec3 v = q.x - q.old;
-                    Vec3 tang = v - ax.up * Dot(v, ax.up);
-                    q.old = q.x - tang * 0.6f;
+                    p[i].x -= ax.up * h;
+                    floorPush[i] -= h;
                 }
             }
         }
-        if (pinned >= 0) { p[pinned].invMass = pinnedMass; pinned = -1; }
+        // Coulomb friction, once per step: the floor takes away at most mu times how hard it pushed, so a body
+        // slides and rolls instead of sticking where it touches (it was applied every iteration: glue).
+        for (size_t i = 0; i < p.size(); ++i) {
+            if (floorPush[i] <= 0) continue;
+            Vec3 v = p[i].x - p[i].old;
+            float vn = Dot(v, ax.up);
+            Vec3 tang = v - ax.up * vn;
+            float tl = Length(tang), cut = std::min(tl, 0.5f * floorPush[i]);
+            Vec3 keep = tl > 1e-9f ? tang * (1 - cut / tl) : Vec3();
+            p[i].old = p[i].x - keep - ax.up * std::max(vn, 0.0f);
+        }
+        for (size_t k = 0; k < grabSet.size(); ++k) p[grabSet[k]].invMass = grabMass[k];
         float motion = 0;
         for (auto& q : p) motion = std::max(motion, Length(q.x - q.old));
         restTimer = motion < 0.0005f * ax.unitsPerMeter ? restTimer + dt : 0;
@@ -463,6 +526,11 @@ namespace {
 // Bodies whose bones we drive; the hook reads them on whatever thread animates.
 SRWLOCK g_boneLock = SRWLOCK_INIT;
 std::vector<Ragdoll*> g_boneRags;
+// Finger poser: a rotation added to a bone's local transform after the mixer. `base` is the mixer's own
+// value: if a frame leaves the bone untouched (it still holds what we wrote), the offset goes on base again
+// instead of piling up.
+struct BoneOffset { Quat off, base, written; bool has = false; };
+std::unordered_map<uintptr_t, BoneOffset> g_fingerOffsets;
 using SetLocalFn = void(__fastcall*)(void* self, void* edx, const void* xf, float w, float w2, int flag);
 SetLocalFn g_origSetLocal = nullptr;
 using InvalidateFn = void(__fastcall*)(void* self, void* edx);
@@ -476,12 +544,28 @@ void __fastcall HookSetLocal(void* self, void* edx, const void* xf, float w, flo
     g_origSetLocal(self, edx, xf, w, w2, flag);
     uintptr_t a = (uintptr_t)self;
     AcquireSRWLockShared(&g_boneLock);
+    bool rag = false;
     for (Ragdoll* r : g_boneRags)
         if (a >= r->nodes && a < r->nodes + r->count * kNodeSize && (a - r->nodes) % kNodeSize == 0) {
             WriteBone(*r, a, (int)((a - r->nodes) / kNodeSize));
+            rag = true;
             break;
         }
     ReleaseSRWLockShared(&g_boneLock);
+    if (!rag && !g_fingerOffsets.empty()) {
+        AcquireSRWLockExclusive(&g_boneLock);
+        auto it = g_fingerOffsets.find(a);
+        if (it != g_fingerOffsets.end()) {
+            BoneOffset& o = it->second;
+            Quat cur;
+            memcpy(&cur, (void*)(a + 0x1c), 16);
+            if (!o.has || memcmp(&cur, &o.written, 16) != 0) o.base = cur;
+            o.has = true;
+            o.written = Normalize(o.base * o.off);
+            memcpy((void*)(a + 0x1c), &o.written, 16);
+        }
+        ReleaseSRWLockExclusive(&g_boneLock);
+    }
 }
 
 bool EnsureBoneHook() {
@@ -504,6 +588,24 @@ void RegisterBones(Ragdoll* r) {
     ReleaseSRWLockExclusive(&g_boneLock);
 }
 }  // namespace
+
+// ===================================================================== finger poser
+// The bone nodes carry no names we can read, so hands are found by shape: a bone with four to six children
+// that each continue as a chain 2.5-20 cm long (the fingers), in a mirrored pair. The thumb is the chain
+// pointing most away from the others; index to pinky follow from the thumb's side. A finger curls about the
+// axis it already bends around in the current pose (towards the palm), and the hook adds that rotation to
+// each joint after the animation mixer, so the pose holds while the character idles.
+struct FingerRig {
+    struct Finger { std::vector<uintptr_t> joints; std::vector<Vec3> axes; float maxDeg = 70; };
+    std::vector<Finger> fingers;
+    ~FingerRig() {
+        AcquireSRWLockExclusive(&g_boneLock);
+        for (auto& f : fingers)
+            for (auto n : f.joints) g_fingerOffsets.erase(n);
+        ReleaseSRWLockExclusive(&g_boneLock);
+    }
+};
+
 
 Ragdoll::~Ragdoll() {
     AcquireSRWLockExclusive(&g_boneLock);
@@ -613,6 +715,7 @@ float Rand(float a, float b) { return std::uniform_real_distribution<float>(a, b
 // physgun
 Entity* g_held = nullptr;
 float g_holdDist = 0;
+Vec3 g_gripForward;  // the aim when a ragdoll was gripped: its piece turns with the yaw since
 int g_physLoop = 0;
 Vec3 g_lastHeldPos;
 // toolgun
@@ -772,6 +875,25 @@ void Physgun(lua::State* L) {
             if (e) {
                 g_held = e;
                 g_holdDist = dist;
+                if (e->dead && e->ragdoll && e->ragdoll->skeletal) {  // grip the bone under the crosshair
+                    Ragdoll& r = *e->ragdoll;
+                    int best = r.pelvis;
+                    float bd = 1e30f;
+                    for (int i = 0; i < r.count; ++i) {
+                        if (r.mass[i] < 0.5f) continue;  // not a finger or a face bone: the body would hang off it
+                        Vec3 rel = r.p[i].x - p.eye;
+                        float t = Dot(rel, p.forward);
+                        if (t <= 0) continue;
+                        float d = Length(rel - p.forward * t);
+                        if (d < bd) { bd = d; best = i; }
+                    }
+                    r.Grip(best);
+                    g_gripForward = p.forward;
+                    g_holdDist = Dot(r.p[best].x - p.eye, p.forward);
+                }
+                Log("[physgun] holding %s%s (bone %d of piece %d, pelvis %d)", e->name.c_str(), e->dead ? " (dead)" : "",
+                    e->ragdoll ? e->ragdoll->grab : -1, e->ragdoll ? (int)e->ragdoll->grabSet.size() : 0,
+                    e->ragdoll ? e->ragdoll->pelvis : -1);
                 e->phys = Phys::Held;
                 g_lastHeldPos = e->pos;
                 g_physLoop = audio::PlayLoop("sound/weapons/physcannon/hold_loop.wav", 0.5f);
@@ -782,6 +904,10 @@ void Physgun(lua::State* L) {
             g_held->phys = g_held->dead ? Phys::Ragdoll : Phys::Rigid;
             g_held->vel = (g_held->pos - g_lastHeldPos) * (1.0f / std::max(w.dt, 0.001f));
         }
+        if (g_held->ragdoll && g_held->ragdoll->skeletal) {  // the bones already carry the swing
+            g_held->ragdoll->Release();
+            g_held->vel = Vec3();
+        }
         g_held = nullptr;
         audio::Stop(g_physLoop);
         audio::Play("sound/weapons/physgun_off.wav", 0.6f);
@@ -789,6 +915,7 @@ void Physgun(lua::State* L) {
     if (!g_held) return;
     Entity& e = *g_held;
     if (in.pressed[VK_RBUTTON]) {  // freeze in place, GMod style
+        if (e.ragdoll) e.ragdoll->Release();
         e.phys = Phys::Frozen;
         e.vel = Vec3();
         g_held = nullptr;
@@ -803,19 +930,34 @@ void Physgun(lua::State* L) {
         e.rot = Normalize(qx * qy * e.rot);
     }
     g_lastHeldPos = e.pos;
+    if (e.dead && e.ragdoll && e.ragdoll->skeletal) {  // the gripped bone follows the beam; the rest hangs and swings
+        Ragdoll& r = *e.ragdoll;
+        r.grabTarget = p.eye + p.forward * g_holdDist;
+        if (in.down['E'])  // E: turn the gripped piece with the mouse
+            for (auto& o : r.grabOff)
+                o = Quat::AxisAngle(p.right, Deg2Rad(in.mouseDy * 0.4f)).Rotate(Quat::AxisAngle(w.axes.up, Deg2Rad(in.mouseDx * 0.4f)).Rotate(o));
+        // the piece turns with the player's yaw since the grab
+        Vec3 U = w.axes.up, f0 = g_gripForward - U * Dot(g_gripForward, U), f1 = p.forward - U * Dot(p.forward, U);
+        Quat yaw = Length(f0) > 1e-3f && Length(f1) > 1e-3f ? FromTo(Normalize(f0), Normalize(f1)) : Quat();
+        for (size_t k = 0; k < r.grabSet.size(); ++k) r.grabTargets[k] = r.grabTarget + yaw.Rotate(r.grabOff[k]);
+        static float logClock = 0;
+        if ((logClock += w.dt) > 0.5f) {  // how it hangs, for tuning
+            logClock = 0;
+            float upm = w.axes.unitsPerMeter, gy = Dot(r.p[r.grab].x, U), lo = 1e30f;
+            for (auto& q : r.p) lo = std::min(lo, Dot(q.x, U));
+            Log("[physgun] grip %.2f m off; head %+.2f m, lowest %+.2f m from the grip",
+                Length(r.p[r.grab].x - r.grabTarget) / upm, (Dot(r.p[r.head].x, U) - gy) / upm, (lo - gy) / upm);
+        }
+        r.restTimer = 0;
+        e.dirty = true;
+        return;
+    }
     Vec3 target = p.eye + p.forward * g_holdDist - w.axes.up * ((e.character ? e.height * 0.5f : 0.3f) * Upm());
     e.pos += (target - e.pos) * std::min(1.0f, w.dt * 15.0f);
-    if (e.dead && e.ragdoll) {  // drag the corpse by its pelvis
+    if (e.dead && e.ragdoll) {  // the 7-particle body: drag it along
         Ragdoll& r = *e.ragdoll;
         Vec3 d = target + w.axes.up * (r.pelvisHeight) - r.p[r.pelvis].x;
-        if (r.skeletal) {  // held by the pelvis, the rest hangs
-            r.p[r.pelvis].x += d;
-            r.p[r.pelvis].old += d * 0.8f;
-            r.pinned = r.pelvis;
-            r.restTimer = 0;
-        } else {
-            for (auto& q : r.p) { q.x += d * 0.5f; q.old += d * 0.5f; }
-        }
+        for (auto& q : r.p) { q.x += d * 0.5f; q.old += d * 0.5f; }
     }
     e.dirty = true;
 }
@@ -937,7 +1079,7 @@ void Physics(lua::State* L) {
                 }
             }
             e.dirty = true;
-        } else if (e.phys == Phys::Ragdoll && e.ragdoll) {
+        } else if (e.ragdoll && (e.phys == Phys::Ragdoll || (e.phys == Phys::Held && e.ragdoll->skeletal))) {
             if (Length(e.vel) > 0) {  // a thrown corpse: hand the velocity to the particles
                 for (auto& q : e.ragdoll->p) q.old = q.x - e.vel * Ragdoll::kStep;
                 e.vel = Vec3();
@@ -946,12 +1088,7 @@ void Physics(lua::State* L) {
                 Ragdoll& sim = *e.ragdoll;
                 const float h = Ragdoll::kStep;
                 sim.stepClock = std::min(sim.stepClock + dt, 4 * h);
-                int pin = sim.pinned;
-                for (; sim.stepClock >= h; sim.stepClock -= h) {
-                    sim.pinned = pin;
-                    sim.Step(h, w.axes, e.groundY);
-                }
-                sim.pinned = -1;
+                for (; sim.stepClock >= h; sim.stepClock -= h) sim.Step(h, w.axes, e.groundY);
                 // Walls: a body that was on the walk boxes slides along their edge (pelvis only).
                 Ragdoll& rd = *e.ragdoll;
                 Vec3 pel = rd.p[rd.pelvis].x, off = pel - SnapToWalkBoxes(L, pel);
@@ -1195,6 +1332,7 @@ void Kill(lua::State* L, Entity* e, const Vec3& impulse) {
 void SetEmotion(lua::State* L, Entity* e, const std::string& emotion) {
     if (!e || !e->info || e->info->facePrefix.empty()) return;
     if (e->emotionHandle >= 0) { lua::Call(L, "GM.StopClip", {e->emotionHandle}); e->emotionHandle = -1; }
+    e->emotion.clear();
     if (emotion.empty()) return;
     std::string clip;
     if (emotion == "dead") {
@@ -1217,10 +1355,72 @@ void SetEmotion(lua::State* L, Entity* e, const std::string& emotion) {
         return;
     }
     // "angry" -> the first of the character's phoneme_default_<emotion> rest faces starting with it.
+    std::string lower = ToLower(emotion);
     for (auto& em : e->info->emotions)
-        if (ToLower(em).rfind(emotion, 0) == 0) { clip = e->info->facePrefix + "_phoneme_default_" + em + ".anm"; break; }
+        if (ToLower(em).rfind(lower, 0) == 0) {
+            clip = e->info->facePrefix + "_phoneme_default_" + em + ".anm";
+            e->emotion = em;
+            break;
+        }
     if (clip.empty()) { hud::Notify(e->name + " has no '" + emotion + "' face"); return; }
     e->emotionHandle = (int)lua::Call(L, "GM.PlayClip", {e->name, clip, true, 1.0f, 80}, 1).N(0, -1);
+    if (!e->mouthShape.empty()) SetMouth(L, e, e->mouthShape, e->mouthWeight);  // that emotion's version of it
+}
+
+// Mouth shapes: the lip-sync poses <face>_phoneme_<shape>_<emotion>.anm ("AA" open, "O" round, "MM" shut,
+// "EE" wide...). One is laid over the rest face with a weight: how far the mouth goes into that shape.
+std::vector<std::string> MouthShapes(const std::string& facePrefix) {
+    static std::map<std::string, std::vector<std::string>> cache;
+    auto it = cache.find(facePrefix);
+    if (it != cache.end()) return it->second;
+    std::vector<std::string> out;
+    std::string pre = ToLower(facePrefix + "_phoneme_");
+    for (auto& n : AssetBridge::Get().Telltale().Find(pre)) {
+        std::string l = ToLower(n);
+        if (l.rfind(pre, 0) != 0) continue;
+        size_t a = pre.size(), b = l.find('_', a);
+        if (b == std::string::npos) continue;
+        std::string shape = l.substr(a, b - a);
+        for (auto& ch : shape) ch = (char)std::toupper((unsigned char)ch);
+        if (shape != "DEFAULT" && std::find(out.begin(), out.end(), shape) == out.end()) out.push_back(shape);
+    }
+    std::sort(out.begin(), out.end());
+    cache[facePrefix] = out;
+    return out;
+}
+
+void SetMouth(lua::State* L, Entity* e, const std::string& shape, float weight) {
+    if (!e || !e->info || e->info->facePrefix.empty()) return;
+    if (e->mouthHandle >= 0 && shape == e->mouthShape && weight > 0) {  // just the slider
+        e->mouthWeight = weight;
+        lua::Call(L, "GM.ClipWeight", {e->mouthHandle, weight});
+        return;
+    }
+    if (e->mouthHandle >= 0) { lua::Call(L, "GM.StopClip", {e->mouthHandle}); e->mouthHandle = -1; }
+    e->mouthShape = shape;
+    e->mouthWeight = weight;
+    if (shape.empty() || weight <= 0) return;
+    // this shape in the current emotion, else its first variant (angryB -> angry*), else normal, else any
+    std::string pre = ToLower(e->info->facePrefix + "_phoneme_" + shape + "_");
+    std::string emo = ToLower(e->emotion.empty() ? "normala" : e->emotion);
+    std::string base = emo.size() > 1 ? emo.substr(0, emo.size() - 1) : emo;
+    std::string exact, sameBase, normal, any;
+    for (auto& n : AssetBridge::Get().Telltale().Find(pre)) {
+        std::string l = ToLower(n);
+        if (l.rfind(pre, 0) != 0 || l.size() < 4 || l.compare(l.size() - 4, 4, ".anm") != 0 || l.find("smoking") != std::string::npos)
+            continue;
+        std::string tail = l.substr(pre.size(), l.size() - pre.size() - 4);
+        if (tail == emo) exact = n;
+        else if (sameBase.empty() && tail.rfind(base, 0) == 0) sameBase = n;
+        else if (normal.empty() && tail.rfind("normal", 0) == 0) normal = n;
+        else if (any.empty()) any = n;
+    }
+    std::string clip = !exact.empty() ? exact : !sameBase.empty() ? sameBase : !normal.empty() ? normal : any;
+    if (clip.empty()) { hud::Notify(e->name + " has no '" + shape + "' mouth"); return; }
+    e->mouthHandle = (int)lua::Call(L, "GM.PlayClip", {e->name, clip, true, weight, 82}, 1).N(0, -1);
+    if (e->mouthHandle < 0) return;
+    lua::Call(L, "GM.ClipPercent", {e->mouthHandle, 0.5f});
+    lua::Call(L, "GM.ClipSpeed", {e->mouthHandle, 0.0f});
 }
 
 void SetFaceChannel(lua::State* L, Entity* e, size_t ch, float weight) {
@@ -1267,8 +1467,14 @@ void OnExitSandbox(lua::State* L) {
     audio::Stop(g_physLoop);
     g_held = nullptr;
     for (auto& e : w.ents) {
+        if (e->fingerRig) {  // fingers back to the animation, while the bones still exist
+            std::fill(e->fingerCurl.begin(), e->fingerCurl.end(), 0.0f);
+            ApplyFingers(e.get());
+            e->fingerRig.reset();
+        }
         if (e->clipHandle >= 0) lua::Call(L, "GM.StopClip", {e->clipHandle});
         if (e->emotionHandle >= 0) lua::Call(L, "GM.StopClip", {e->emotionHandle});
+        if (e->mouthHandle >= 0) lua::Call(L, "GM.StopClip", {e->mouthHandle});
         for (auto& fh : e->faceHandles) lua::Call(L, "GM.StopClip", {fh.second});
         if (e->spawned) lua::Call(L, "GM.Destroy", {e->name});
     }
@@ -1409,6 +1615,161 @@ std::vector<Vec3> RocketPositions() {
     return v;
 }
 const std::string& ToolInfo() { return g_toolInfo; }
+
+void BuildFingers(Entity* e) {
+    World& w = GetWorld();
+    const Axes& ax = w.axes;
+    float upm = ax.unitsPerMeter;
+    e->fingerHands = 0;
+    int count = 0;
+    uintptr_t nodes = 0;
+    if (!EnsureBoneHook() || !FindSkeleton(e->pos, ax, &count, &nodes)) {
+        Log("[fingers] %s: no skeleton", e->name.c_str());
+        return;
+    }
+    std::vector<int> parent(count, -1);
+    std::vector<Vec3> P(count);
+    std::vector<Quat> G(count);
+    for (int i = 0; i < count; ++i) {
+        uintptr_t n = nodes + i * kNodeSize;
+        float gq[4], gp[3];
+        uint32_t par = 0;
+        if (!SafeRead(n + 0x3c, gq, 16) || !SafeRead(n + 0x4c, gp, 12) || !SafeRead(n + 0x64, &par, 4)) return;
+        G[i] = Normalize(Quat(gq[0], gq[1], gq[2], gq[3]));
+        P[i] = Vec3(gp[0], gp[1], gp[2]);
+        if (par >= nodes && par < nodes + count * kNodeSize && (par - nodes) % kNodeSize == 0)
+            parent[i] = (int)((par - nodes) / kNodeSize);
+        if (parent[i] >= i) return;
+    }
+    std::vector<std::vector<int>> kids(count);
+    for (int i = 0; i < count; ++i)
+        if (parent[i] >= 0) kids[parent[i]].push_back(i);
+    std::vector<int> depth(count, 0);
+    for (int i = count - 1; i >= 0; --i)
+        for (int k : kids[i]) depth[i] = std::max(depth[i], depth[k] + 1);
+    auto chainFrom = [&](int b) {
+        std::vector<int> c{b};
+        while (!kids[c.back()].empty()) {
+            int nx = -1;
+            for (int k : kids[c.back()])
+                if (nx < 0 || depth[k] > depth[nx]) nx = k;
+            c.push_back(nx);
+        }
+        return c;
+    };
+    struct Cand { int h; std::vector<std::vector<int>> chains; float total = 0; };
+    std::vector<Cand> cands;
+    for (int i = 0; i < count; ++i) {
+        Cand c{i, {}, 0};
+        for (int k : kids[i]) {
+            if (depth[k] < 1) continue;
+            auto ch = chainFrom(k);
+            float len = Length(P[ch.back()] - P[ch[0]]);
+            if (len > 0.025f * upm && len < 0.2f * upm && ch.size() <= 6) { c.chains.push_back(ch); c.total += len; }
+        }
+        if (c.chains.size() >= 4 && c.chains.size() <= 6) cands.push_back(c);
+    }
+    // the most alike pair (the face can look like a hand too, but it has no twin)
+    int bi = -1, bj = -1;
+    float best = 1e30f;
+    for (size_t i = 0; i < cands.size(); ++i)
+        for (size_t j = i + 1; j < cands.size(); ++j) {
+            if (Length(P[cands[i].h] - P[cands[j].h]) < 0.05f * upm) continue;
+            float score = std::fabs((float)cands[i].chains.size() - (float)cands[j].chains.size()) +
+                          std::fabs(cands[i].total - cands[j].total) / (0.05f * upm);
+            if (score < best) { best = score; bi = (int)i; bj = (int)j; }
+        }
+    std::vector<Cand> hands;
+    if (bi >= 0) { hands.push_back(cands[bi]); hands.push_back(cands[bj]); }
+    else if (cands.size() == 1) hands.push_back(cands[0]);
+    Log("[fingers] %s: %zu hand-shaped bones, using %zu", e->name.c_str(), cands.size(), hands.size());
+    if (hands.empty()) return;
+    // Telltale's right is -cross(up, forward), for characters as for the camera
+    Vec3 fwd = e->rot.Rotate(g_charLocalForward), right = Cross(ax.up, fwd) * -1.0f;
+    Vec3 mid = hands.size() == 2 ? (P[hands[0].h] + P[hands[1].h]) * 0.5f : e->pos;
+    auto rig = std::make_shared<FingerRig>();
+    std::vector<std::string> names;
+    const char* fingerNames[] = {"thumb", "index", "middle", "ring", "pinky"};
+    for (auto& hc : hands) {
+        std::string side = hands.size() < 2 ? "" : Dot(P[hc.h] - mid, right) > 0 ? "R " : "L ";
+        Vec3 m;
+        Vec3 meanBase;
+        for (auto& c : hc.chains) { m += Normalize(P[c.back()] - P[c[0]]); meanBase += P[c[0]]; }
+        m = Normalize(m);
+        meanBase = meanBase * (1.0f / hc.chains.size());
+        int thumb = 0;
+        float lowest = 2;
+        for (size_t c = 0; c < hc.chains.size(); ++c) {
+            float d = Dot(Normalize(P[hc.chains[c].back()] - P[hc.chains[c][0]]), m);
+            if (d < lowest) { lowest = d; thumb = (int)c; }
+        }
+        Vec3 across = P[hc.chains[thumb][0]] - meanBase;
+        across = across - m * Dot(across, m);
+        std::vector<int> order{thumb};
+        std::vector<int> rest;
+        for (size_t c = 0; c < hc.chains.size(); ++c)
+            if ((int)c != thumb) rest.push_back((int)c);
+        std::sort(rest.begin(), rest.end(), [&](int a, int b) {
+            return Dot(P[hc.chains[a][0]] - meanBase, across) > Dot(P[hc.chains[b][0]] - meanBase, across);
+        });
+        for (int r : rest)
+            if (order.size() < 5) order.push_back(r);
+        // bend direction: how each finger already curls; straight ones borrow the hand's average
+        std::vector<Vec3> bend(order.size());
+        Vec3 avg;
+        for (size_t f = 0; f < order.size(); ++f) {
+            auto& c = hc.chains[order[f]];
+            Vec3 dir = Normalize(P[c[1]] - P[c[0]]), b = P[c.back()] - P[c[0]];
+            b = b - dir * Dot(b, dir);
+            if (Length(b) > 0.004f * upm) { bend[f] = Normalize(b); if (f) avg += bend[f]; }
+        }
+        if (Length(avg) < 1e-4f) avg = Cross(m, across);
+        avg = Normalize(avg);
+        for (size_t f = 0; f < order.size(); ++f) {
+            auto c = hc.chains[order[f]];
+            if (c.size() > 1 && kids[c.back()].empty()) c.pop_back();  // the tip marker moves nothing
+            if (c.size() >= 4) c.erase(c.begin());                      // a palm bone in front of the finger
+            Vec3 dir = Normalize(P[c.size() > 1 ? c[1] : hc.chains[order[f]].back()] - P[c[0]]);
+            Vec3 b = Length(bend[f]) > 0.5f ? bend[f] : avg;
+            Vec3 axis = Normalize(Cross(dir, b));
+            FingerRig::Finger fg;
+            fg.maxDeg = f == 0 ? 35.0f : 70.0f;
+            for (int j : c) {
+                fg.joints.push_back(nodes + j * kNodeSize);
+                fg.axes.push_back(Conj(G[j]).Rotate(axis));
+            }
+            rig->fingers.push_back(fg);
+            names.push_back(side + (f < 5 ? fingerNames[f] : "finger"));
+        }
+    }
+    e->fingerRig = rig;
+    e->fingerNames = names;
+    e->fingerCurl.assign(names.size(), 0.0f);
+    e->fingerHands = (int)hands.size();
+}
+
+void ApplyFingers(Entity* e) {
+    if (!e || !e->fingerRig) return;
+    AcquireSRWLockExclusive(&g_boneLock);
+    for (size_t f = 0; f < e->fingerRig->fingers.size() && f < e->fingerCurl.size(); ++f) {
+        auto& fg = e->fingerRig->fingers[f];
+        float v = e->fingerCurl[f];
+        for (size_t j = 0; j < fg.joints.size(); ++j) {
+            uintptr_t n = fg.joints[j];
+            if (std::fabs(v) < 1e-3f) {  // back to the animation
+                auto it = g_fingerOffsets.find(n);
+                if (it != g_fingerOffsets.end()) {
+                    if (it->second.has) SafeWrite(n + 0x1c, &it->second.base, 16);
+                    g_fingerOffsets.erase(it);
+                }
+                continue;
+            }
+            float deg = fg.maxDeg * v * (j == 0 ? 0.8f : 1.0f);
+            g_fingerOffsets[n].off = Quat::AxisAngle(fg.axes[j], Deg2Rad(deg));
+        }
+    }
+    ReleaseSRWLockExclusive(&g_boneLock);
+}
 
 }  // namespace combat
 }  // namespace gm

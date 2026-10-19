@@ -409,6 +409,37 @@ The user asked to keep working on the ragdoll and reported that many maps fail t
 - Test driving: the game window's client area is now 1066x600 logical; click at its centre (`rect`), and run
   `mdown` in the same call as `focus`.
 
+### GMod physics, viewmodel bob, Face & Finger Poser (2026-10-19)
+The goal: corpses that fall limp as in GMod, a physgunned body that still swings (not a dried mummy),
+weapon bob while running, and finger and face control.
+- Why the body was stiff: a held corpse wasn't simulated at all (only its pelvis was dragged), floor friction
+  ran every solver iteration (glue), and every particle weighed the same (the 15 finger bones outweighed the
+  chest; face bones made the head a lead ball).
+- Masses: bones under 6 cm weigh 50 g, trunk bones `5 + 20 * length` kg, limb bones `12 * length`, the pelvis
+  at least 10; a light bone between heavy ones (twist helpers) gets 1 kg so the limb doesn't stretch.
+- Shots: momentum (as if into 40 kg) goes to the bones within 35 cm of the hit, by mass: the trunk goes back
+  and the arms fly up.
+- Floor: Coulomb friction once per step (at most 0.5 x how far the floor pushed), so bodies slide and roll.
+- Physgun: grips the heaviest-enough bone nearest the aim ray. That bone and the two that orient its piece
+  follow the beam with a stiff spring and turn with the player's yaw (as GMod holds a physics object's
+  angles); the rest of the body keeps simulating and hangs off it. Held by the pelvis, Snow folds in a V (head
+  and feet 0.6-1.0 m below the grip) and swings +-0.15 m as the beam moves. Without the orientation hold
+  she cartwheeled over the grip.
+- A test trap: in `adv_andersenWoodsmanAptNight` the story's own Faith stands next to a spawned Faith; the
+  physgun took the live one. Test with a character the scene doesn't have (`spawn snow`). The log now says
+  what the physgun holds.
+- Viewmodel bob: HL2's `CalcViewmodelBob`/`AddViewmodelBob` (vertical cycle 0.45 s, lateral 0.9 s; pitch,
+  roll, yaw and offsets). Our speeds map to GMod's (walk 3 m/s = 200 units/s, run 6 m/s = 400, capped 320);
+  metres x 39.37 gave 118 units at a walk and a bob too small to see.
+- Face & Finger Poser (C): all rest faces (Bigby 23, Faith 12), 11 mouth shapes with an amount slider (the
+  `phoneme_<shape>_<emotion>` clip at 50%, speed 0), the channel sliders, and fingers. Hands are found by
+  shape; Bigby: 2 hands, 10 fingers. The finger rotation goes on after the mixer in the per-bone hook, and is
+  re-based whenever the mixer writes the bone, so it doesn't pile up.
+- Verified in game: Snow shot at point-blank falls back with arms flailing; physgun lift and swing (numbers
+  above); Bigby angry + mouth AA + a fist (thumb over the fingers); the shotgun bobs and sways at a walk.
+- Test driving: mouse sensitivity is 0.12 degrees per mickey, so lifting needs `rel 0 -400`, not `-40`; `hold`
+  takes a VK code (`hold 0x57 2000`), not a letter.
+
 ### Restore path
 Installed: `dinput8.dll`, `TWAU_GMod.asi`, `gmod\` (ini, `lua\`, log, `dump\`) in the game folder. Uninstall:
 delete those three. Saves were backed up with `um backup` before the first modded launch. `gmod\dump\`

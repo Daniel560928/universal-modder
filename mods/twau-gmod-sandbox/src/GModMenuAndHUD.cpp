@@ -229,13 +229,27 @@ void DrawViewmodel(IDirect3DDevice9* dev, const World& w, float W, float H) {
     dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
     // Source's viewmodel_fov 54 is horizontal at 4:3 -> 41.6 degrees vertical.
     Mat4 proj = Mat4::PerspectiveFovLH(Deg2Rad(41.6f), W / H, 1.0f, 512.0f);
-    Mat4 world = Mat4::Identity();
-    // bob, sway and recoil kick (in Source units, the model's own scale)
+    // Bob as HL2 does it (CalcViewmodelBob / AddViewmodelBob): speed in Source units (320 = running) drives
+    // a vertical cycle every 0.45 s and a lateral one every 0.9 s; the gun moves and also pitches, rolls
+    // and yaws with them. Then mouse sway and the recoil kick. View space: x right, y up, z forward.
+    static float bobTime = 0, lastTime = 0;
     float speed = Length(Vec3(p.vel.x, 0, p.vel.z)) / std::max(0.01f, w.axes.unitsPerMeter);
-    float bob = p.onGround && !p.noclip ? std::min(1.0f, speed / 4.0f) : 0;
-    world.m[3][0] = std::sin(p.bob) * 0.6f * bob - p.swayX;
-    world.m[3][1] = -std::fabs(std::cos(p.bob)) * 0.4f * bob - p.swayY - p.punchPitch * 0.15f;
-    world.m[3][2] = -p.punchPitch * 0.25f;
+    // GMod's speeds, not metres: our walk (3 m/s) is its 200 units/s and our run (6 m/s) its 400 (capped at 320)
+    float su = p.onGround && !p.noclip ? Clamp(speed * (400.0f / 6.0f), 0, 320) : 0;
+    if (w.time > lastTime) bobTime += (w.time - lastTime) * (su / 320);
+    lastTime = w.time;
+    auto cycle = [](float t, float period) { return 2 * kPi * (std::fmod(t, period) / period); };
+    float vb = Clamp(su * 0.005f * (0.3f + 0.7f * std::sin(cycle(bobTime, 0.45f))), -7, 4);
+    float lb = Clamp(su * 0.005f * (0.3f + 0.7f * std::sin(cycle(bobTime, 0.9f))), -7, 4);
+    float pitch = Deg2Rad(-vb * 0.4f - p.punchPitch * 0.5f), yaw = Deg2Rad(lb * 0.3f), roll = Deg2Rad(-vb * 0.5f);
+    Mat4 rx = Mat4::Identity(), ry = Mat4::Identity(), rz = Mat4::Identity();
+    rx.m[1][1] = std::cos(pitch); rx.m[1][2] = std::sin(pitch); rx.m[2][1] = -std::sin(pitch); rx.m[2][2] = std::cos(pitch);
+    ry.m[0][0] = std::cos(yaw); ry.m[0][2] = -std::sin(yaw); ry.m[2][0] = std::sin(yaw); ry.m[2][2] = std::cos(yaw);
+    rz.m[0][0] = std::cos(roll); rz.m[0][1] = std::sin(roll); rz.m[1][0] = -std::sin(roll); rz.m[1][1] = std::cos(roll);
+    Mat4 world = rz * rx * ry;
+    world.m[3][0] = lb * 0.8f - p.swayX;
+    world.m[3][1] = vb * 0.1f - p.swayY - p.punchPitch * 0.15f;
+    world.m[3][2] = vb * 0.1f - p.punchPitch * 0.25f;
     SetMatrix(dev, D3DTS_WORLD, world);
     SetMatrix(dev, D3DTS_VIEW, Mat4::Identity());
     SetMatrix(dev, D3DTS_PROJECTION, proj);
@@ -606,7 +620,7 @@ void SpawnMenu(World& w, float W, float H) {
 void ContextMenu(World& w, float W, float H) {
     ImGui::SetNextWindowPos(ImVec2(W * 0.70f, H * 0.08f));
     ImGui::SetNextWindowSize(ImVec2(W * 0.27f, H * 0.84f));
-    ImGui::Begin("Face Poser", nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
+    ImGui::Begin("Face & Finger Poser", nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse);
     Entity* e = w.facePoserTarget;
     if (!e || !e->info) {
         ImGui::TextWrapped("Pick a character with the Tool Gun in Face Poser mode (R cycles tool modes), then hold C.");
@@ -614,52 +628,100 @@ void ContextMenu(World& w, float W, float H) {
         return;
     }
     ImGui::Text("%s  (%s)", e->name.c_str(), e->info->facePrefix.c_str());
-    ImGui::Separator();
-    const char* presets[] = {"Angry", "Sad", "Fear", "Happy", "Surprised", "Disgust", "Dead"};
-    // Telltale has no sad/disgust rest face for every character; fall back to the nearest it has.
-    const char* tokens[][3] = {{"angry", "", ""}, {"sad", "worried", "concerned"}, {"fear", "scared", "worried"},
-                               {"happy", "", ""}, {"surprised", "confused", ""}, {"disgust", "mocking", "sarcastic"},
-                               {"dead", "", ""}};
-    for (int i = 0; i < 7; ++i) {
-        if (i % 4) ImGui::SameLine();
-        if (ImGui::Button(presets[i], ImVec2(W * 0.06f, 0))) {
-            Entity* target = e;
-            std::vector<std::string> tk(tokens[i], tokens[i] + 3);
-            PostCommand([target, tk](lua::State* L) {
-                std::lock_guard<std::recursive_mutex> lk(WorldLock());
-                if (tk[0] == "dead") { combat::SetEmotion(L, target, "dead"); return; }
-                for (auto& t : tk) {
-                    if (t.empty()) continue;
-                    for (auto& em : target->info->emotions)
-                        if (ToLower(em).rfind(t, 0) == 0) { combat::SetEmotion(L, target, t); return; }
+    Entity* target = e;
+    auto post = [](std::function<void(lua::State*)> f) {
+        PostCommand([f](lua::State* L) { std::lock_guard<std::recursive_mutex> lk(WorldLock()); f(L); });
+    };
+    float bw = W * 0.083f;
+    // Emotions: every rest face the character ships (Bigby has 27, Faith 12)
+    if (ImGui::CollapsingHeader("Emotion", ImGuiTreeNodeFlags_DefaultOpen)) {
+        int col = 0;
+        for (auto& em : e->info->emotions) {
+            if (col++ % 3) ImGui::SameLine();
+            bool on = ToLower(em) == ToLower(e->emotion);
+            if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.45f, 0.8f, 1));
+            if (ImGui::Button(em.c_str(), ImVec2(bw, 0))) {
+                std::string pick = em;
+                post([target, pick](lua::State* L) { combat::SetEmotion(L, target, pick); });
+            }
+            if (on) ImGui::PopStyleColor();
+        }
+        if (ImGui::Button("Neutral", ImVec2(bw, 0))) post([target](lua::State* L) { combat::SetEmotion(L, target, ""); });
+        ImGui::SameLine();
+        if (ImGui::Button("Eyes shut", ImVec2(bw, 0))) post([target](lua::State* L) { combat::SetEmotion(L, target, "dead"); });
+    }
+    // Mouth: a lip-sync shape over the emotion, as far as the slider says
+    auto shapes = combat::MouthShapes(e->info->facePrefix);
+    if (!shapes.empty() && ImGui::CollapsingHeader("Mouth", ImGuiTreeNodeFlags_DefaultOpen)) {
+        for (size_t i = 0; i <= shapes.size(); ++i) {
+            if (i % 6) ImGui::SameLine();
+            std::string sh = i < shapes.size() ? shapes[i] : "";
+            bool on = sh == e->mouthShape;
+            if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.45f, 0.8f, 1));
+            if (ImGui::Button(sh.empty() ? "none" : sh.c_str(), ImVec2(W * 0.038f, 0))) {
+                float wgt = e->mouthWeight > 0 ? e->mouthWeight : 1.0f;
+                post([target, sh, wgt](lua::State* L) { combat::SetMouth(L, target, sh, wgt); });
+            }
+            if (on) ImGui::PopStyleColor();
+        }
+        float mw = e->mouthWeight;
+        if (ImGui::SliderFloat("amount", &mw, 0.0f, 1.0f) && !e->mouthShape.empty()) {
+            e->mouthWeight = mw;
+            std::string sh = e->mouthShape;
+            post([target, sh, mw](lua::State* L) { combat::SetMouth(L, target, sh, mw); });
+        }
+    }
+    // Channels: the additive face clips (brows, eyes, blinks), each parked at its peak
+    if (ImGui::CollapsingHeader("Face channels")) {
+        auto chans = AssetBridge::Get().Telltale().FaceChannels(e->info->facePrefix);
+        if (e->faceWeights.size() < chans.size()) e->faceWeights.resize(chans.size(), 0);
+        std::string pre = e->info->facePrefix + "_face_";
+        for (size_t i = 0; i < chans.size(); ++i) {
+            std::string label = chans[i].substr(pre.size(), chans[i].size() - pre.size() - 8);  // strip "_add.anm"
+            float v = e->faceWeights[i];
+            if (ImGui::SliderFloat(label.c_str(), &v, 0.0f, 1.0f)) {
+                e->faceWeights[i] = v;
+                post([target, i, v](lua::State* L) { combat::SetFaceChannel(L, target, i, v); });
+            }
+        }
+    }
+    // Fingers: curl per finger, as GMod's Finger Poser
+    if (ImGui::CollapsingHeader("Fingers", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (e->fingerHands == -1) {
+            e->fingerHands = -2;
+            post([target](lua::State*) { combat::BuildFingers(target); });
+        }
+        if (e->fingerHands == -2) {
+            ImGui::TextDisabled("Looking for the hands...");
+        } else if (e->fingerHands == 0) {
+            ImGui::TextWrapped("No hands found on this skeleton.");
+            if (ImGui::Button("Look again")) e->fingerHands = -1;
+        } else {
+            // presets for every hand: thumb, index, middle, ring, pinky
+            struct Preset { const char* name; float c[5]; };
+            const Preset presets[] = {{"Relaxed", {0, 0, 0, 0, 0}},       {"Fist", {0.8f, 1, 1, 1, 1}},
+                                      {"Point", {0.8f, 0, 1, 1, 1}},       {"Thumbs up", {-0.3f, 1, 1, 1, 1}},
+                                      {"Peace", {0.8f, 0, 0, 1, 1}},       {"Rock", {0.8f, 0, 1, 1, 0}},
+                                      {"Flat", {-0.2f, -0.2f, -0.2f, -0.2f, -0.2f}}, {"Claw", {0.5f, 0.55f, 0.55f, 0.55f, 0.55f}}};
+            int col = 0;
+            for (auto& pr : presets) {
+                if (col++ % 4) ImGui::SameLine();
+                if (ImGui::Button(pr.name, ImVec2(W * 0.062f, 0))) {
+                    for (size_t f = 0; f < e->fingerCurl.size(); ++f) e->fingerCurl[f] = pr.c[f % 5];
+                    std::vector<float> curls = e->fingerCurl;
+                    post([target, curls](lua::State*) { target->fingerCurl = curls; combat::ApplyFingers(target); });
                 }
-                Notify("No such face on " + target->name);
-            });
+            }
+            for (size_t f = 0; f < e->fingerCurl.size() && f < e->fingerNames.size(); ++f) {
+                float v = e->fingerCurl[f];
+                if (ImGui::SliderFloat(e->fingerNames[f].c_str(), &v, -0.3f, 1.0f)) {
+                    e->fingerCurl[f] = v;
+                    std::vector<float> curls = e->fingerCurl;
+                    post([target, curls](lua::State*) { target->fingerCurl = curls; combat::ApplyFingers(target); });
+                }
+            }
         }
     }
-    if (ImGui::Button("Neutral", ImVec2(W * 0.06f, 0))) {
-        Entity* target = e;
-        PostCommand([target](lua::State* L) { std::lock_guard<std::recursive_mutex> lk(WorldLock()); combat::SetEmotion(L, target, ""); });
-    }
-    ImGui::Separator();
-    ImGui::TextDisabled("Channels (additive face clips)");
-    auto chans = AssetBridge::Get().Telltale().FaceChannels(e->info->facePrefix);
-    if (e->faceWeights.size() < chans.size()) e->faceWeights.resize(chans.size(), 0);
-    ImGui::BeginChild("chans");
-    std::string pre = e->info->facePrefix + "_face_";
-    for (size_t i = 0; i < chans.size(); ++i) {
-        std::string label = chans[i].substr(pre.size(), chans[i].size() - pre.size() - 8);  // strip "_add.anm"
-        float v = e->faceWeights[i];
-        if (ImGui::SliderFloat(label.c_str(), &v, 0.0f, 1.0f)) {
-            e->faceWeights[i] = v;
-            Entity* target = e;
-            PostCommand([target, i, v](lua::State* L) {
-                std::lock_guard<std::recursive_mutex> lk(WorldLock());
-                combat::SetFaceChannel(L, target, i, v);
-            });
-        }
-    }
-    ImGui::EndChild();
     ImGui::End();
 }
 

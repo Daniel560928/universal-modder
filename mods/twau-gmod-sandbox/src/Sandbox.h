@@ -34,7 +34,8 @@ struct Axes {
 };
 
 // ------------------------------------------------------------------ entities
-struct Ragdoll;  // CombatAndRagdollPhysics.cpp
+struct Ragdoll;    // CombatAndRagdollPhysics.cpp
+struct FingerRig;  // CombatAndRagdollPhysics.cpp
 struct RagdollDeleter {
     void operator()(Ragdoll* r) const;
 };
@@ -86,8 +87,17 @@ struct Entity {
     std::string clipName;
     // face poser
     int emotionHandle = -1;
+    std::string emotion;  // the rest face playing: phoneme_default_<emotion> ("angryB"), "" for none
+    int mouthHandle = -1;
+    std::string mouthShape;  // phoneme mouth over the emotion: "AA", "O", "MM"... ("" for none)
+    float mouthWeight = 1.0f;
     std::vector<std::pair<std::string, int>> faceHandles;  // channel clip -> handle
     std::vector<float> faceWeights;
+    // finger poser: curl per finger (hand * 5 + finger, thumb first), -0.3 bent back .. 1 a fist
+    int fingerHands = -1;  // hands found; -1 not looked yet, -2 looking
+    std::vector<std::string> fingerNames;
+    std::vector<float> fingerCurl;
+    std::shared_ptr<FingerRig> fingerRig;
 };
 
 // ------------------------------------------------------------------ player
@@ -196,6 +206,10 @@ const char* ToolName(ToolMode t);
 Entity* Spawn(lua::State* L, const CharacterInfo& c, bool asNpc);
 void SetEmotion(lua::State* L, Entity* e, const std::string& emotion);  // "" clears
 void SetFaceChannel(lua::State* L, Entity* e, size_t channel, float weight);
+void SetMouth(lua::State* L, Entity* e, const std::string& shape, float weight);  // "" clears
+std::vector<std::string> MouthShapes(const std::string& facePrefix);  // "AA", "EE", ... the face has
+void BuildFingers(Entity* e);   // finds the hands: sets fingerHands, fingerNames, fingerCurl
+void ApplyFingers(Entity* e);   // pushes fingerCurl to the bones
 void Kill(lua::State* L, Entity* e, const Vec3& impulse);
 // Ray vs entities: returns the closest hit (or nullptr) and the distance along the ray.
 Entity* Trace(const Vec3& from, const Vec3& dir, float maxDist, float* outDist, const Entity* ignore = nullptr);

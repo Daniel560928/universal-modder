@@ -22,9 +22,10 @@ character/scene lists straight from your TWAU archives. Nothing from either game
 | The game's own UI (hover verbs, interaction dots, tutorials) | **hidden in sandbox**, back on F3 |
 | Physgun grab and freeze | **works in game** |
 | Flashlight | **works in game** on characters (a copy of the scene's character light); walls and floors stay unlit |
-| Face Poser | **works in game** (presets and channels; the expressions are subtle) |
+| Face & Finger Poser | **works in game**: every rest face the character has (Bigby 23, Faith 12), 11 mouth shapes with an amount slider, face channels, and per-finger curls with presets (fist, point, peace...) |
+| Viewmodel bob | **works in game**: HL2's `CalcViewmodelBob` (the gun bobs, rolls and sways while you walk or run) |
 | Map menu | **works in game**: all 41 Episode 2-5 scenes open (the game's resources switch to that episode; a guard stops a native crash in the game's own scene script); you start on the scene's walk boxes, or fly from the story camera where there are none |
-| Per-bone ragdolls | **works in game**: every bone of the corpse is simulated (Faith: 110), joints bend within limits, knees and elbows one way only, limbs collide with the body and each other; the physgun holds it by the pelvis |
+| Per-bone ragdolls | **works in game**: every bone of the corpse is simulated (Faith: 110), joints bend within limits, knees and elbows one way only, limbs collide with the body and each other; bones weigh by size (trunk heavy, fingers light), shots push the bones near the hit, the floor has Coulomb friction; the physgun grips the bone under the crosshair and the rest hangs and swings |
 | Big Bad Wolf (`sk35`) locomotion | the game data has no walk/run clip for it; it glides in place |
 
 ## Controls
@@ -41,7 +42,7 @@ character/scene lists straight from your TWAU archives. Nothing from either game
 | Wheel (holding) | physgun: push / pull |
 | R | reload; toolgun: next tool mode |
 | Q (hold) | spawn menu: NPCs, ragdolls, playermodels (filter: bipeds / quadrupeds / birds), tools |
-| C (hold) | Face Poser: Angry, Sad, Fear, Happy, Surprised, Disgust, Dead + per-channel sliders |
+| C (hold) | Face & Finger Poser (pick the character with the toolgun's Face Poser mode): emotions, mouth shapes, face channels, fingers |
 | M | map menu: every location of the five episodes |
 | Insert | console (`help`, `lua <code>`, `spawn <name>`, `lookat`, `ai stay/wander/follow`, `map [scene] [episode]`, `probe`, `agents`, `reload`, `thirdperson`; reverse engineering: `skel`, `peek`, `poke`, `hwbp`) |
 
@@ -77,9 +78,16 @@ How the pieces map to the request:
   `sk37_crow` a bird), locomotion clips from the catalog (`sk18_colin_walk.anm`, not a biped walk), with
   siblings of the same skeleton family lending clips (`sk54_crane_walk` drives any `sk54` man). Werewolf
   Bigby sprints with `sk54_bigbyWere_runQuadruped.anm`.
-- **Face Poser:** presets play `<face>_phoneme_default_<emotion>A.anm` (the resting face per emotion);
-  sliders weight additive `<face>_face_brows*/eyesLook*/blink/squint/eyesWide_add.anm` layers with
-  `ControllerSetContribution`. Not every character has every emotion; the menu falls back to the closest.
+- **Face Poser:** emotions play `<face>_phoneme_default_<emotion>.anm` (the resting face per emotion; the
+  menu lists every one the character has). Mouth shapes are the lip-sync poses
+  `<face>_phoneme_<AA|EE|I|O|U|FV|LL|MM|NN|SH|TH>_<emotion>.anm`, parked at their middle frame and weighted
+  by the slider, in the current emotion's variant when there is one. Sliders weight additive
+  `<face>_face_brows*/eyesLook*/blink/squint/eyesWide_add.anm` layers with `ControllerSetContribution`.
+- **Finger Poser:** bones carry no names we can read, so hands are found by shape (a bone with 4-6 child
+  chains 2.5-20 cm long, in a mirrored pair); the thumb is the chain pointing away from the others. A curl
+  turns each joint about the axis the finger already bends around, added after the animation mixer by the
+  same per-bone hook as the ragdolls, so the pose holds while the character idles. Console:
+  `pose emotion angry`, `pose mouth AA 0.8`, `pose fingers 0.8 1 1 1 1` (the last spawn).
 - **Death:** HP per agent; at 0 the clip stops and the corpse becomes a verlet ragdoll with one particle per
   bone. The character's `SkeletonInstance` is found in memory (its root bones hang off the agent's node), the
   bones are grouped into rigid pieces (pelvis, chest, head, hands) joined by cone-limited joints, knees and
