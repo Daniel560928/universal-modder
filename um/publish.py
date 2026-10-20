@@ -23,6 +23,7 @@ SECRET_PATTERNS = [
     ("fal key", re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{32}\b")),
     ("FAL_KEY assignment", re.compile(r"FAL_KEY\s*[=:]\s*['\"]?[A-Za-z0-9:_\-]{20,}")),
     ("Anthropic key", re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}")),
+    ("Sprixen key", re.compile(r"\bspx_live_[A-Za-z0-9_\-]{30,}")),
     # project, service-account and admin keys carry - and _ in their body; legacy keys are plain alphanumerics
     ("OpenAI key", re.compile(r"\bsk-(?:(?:proj|svcacct|admin)-[A-Za-z0-9_\-]{32,}|[A-Za-z0-9]{32,})")),
     # classic tokens (ghp_, gho_, ...) and fine-grained personal access tokens (github_pat_)
@@ -60,8 +61,13 @@ def check(mod: str, game: str | None = None) -> int:
     # game files, matched by size then hash
     if game:
         g = Path(to_posix(game))
+        gr, mine = g.resolve(), root.resolve()
+        # a mod inside the install (Dwarf Fortress mods/<name>) is not game content: don't match it against itself
+        inside = mine.relative_to(gr).parts if mine != gr and mine.is_relative_to(gr) else None
         by_size: dict[int, list[Path]] = {}
         for p in g.rglob("*"):
+            if inside and p.relative_to(g).parts[:len(inside)] == inside:
+                continue
             if p.is_file():
                 try:
                     by_size.setdefault(p.stat().st_size, []).append(p)

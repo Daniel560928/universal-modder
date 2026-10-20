@@ -1,6 +1,6 @@
 """Windows games from an agent (native Windows, or WSL where most coding agents live).
 
-    um win setup                                  # copy the PowerShell tools + fetch an ffmpeg with gfxcapture
+    um win setup                                  # copy the PowerShell tools + fetch an ffmpeg with gfxcapture (SHA-256 checked)
     um win ps [name]                              # processes with windows: pid, name, title
     um win kill <pid>                             # by exact PID only (never by pattern)
     um win launch --steam 105600 [-- args]        # or: um win launch "C:\\Games\\Foo\\foo.exe" -- -windowed
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import ntpath
 import os
 import shutil
 import subprocess
@@ -31,11 +32,12 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-from um.common import die, is_windows, is_wsl, ps_exe, to_posix, to_win
+from um.common import PS_UTF8, die, is_windows, is_wsl, ps_exe, text_console, text_utf8, to_posix, to_win
 
 HERE = Path(__file__).resolve().parent
 TOOLS = HERE / "ps1"          # shipped inside the package so `uv tool install` gets them too
 FFMPEG_URL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+FFMPEG_SUMS = FFMPEG_URL.rsplit("/", 1)[0] + "/checksums.sha256"
 
 
 def _check_platform():
@@ -46,8 +48,11 @@ def _check_platform():
 
 def powershell(script: str, timeout: float = 60) -> str:
     _check_platform()
-    r = subprocess.run([ps_exe(), "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=timeout,
-                       cwd="/mnt/c" if is_wsl() else None)
+    # Window titles and install paths are not ASCII: ask PowerShell for UTF-8 (PS_UTF8), so the bytes match
+    # text_utf8() instead of the console code page.
+    script = PS_UTF8 + script
+    r = subprocess.run([ps_exe(), "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True,
+                       timeout=timeout, cwd="/mnt/c" if is_wsl() else None, **text_utf8())
     if r.returncode:
         die(f"powershell failed: {r.stderr.strip()[-1500:]}")
     return r.stdout.replace("\r", "")
@@ -91,6 +96,39 @@ def ffmpeg_win(required=True) -> str | None:
     return None
 
 
+def ffmpeg_sha256() -> str:
+    """The SHA-256 the ffmpeg zip must have: $UM_FFMPEG_SHA256 (a pin you checked yourself), else the build's own
+    checksums.sha256. The "latest" build is replaced daily and old ones are deleted, so a hash kept in this file
+    would break every setup within days. The published sum catches corrupt, truncated or swapped downloads; it
+    can't catch a compromised release, which is what the pin is for."""
+    pin = os.environ.get("UM_FFMPEG_SHA256", "").strip().lower()
+    if pin:
+        return pin
+    name = FFMPEG_URL.rsplit("/", 1)[1]
+    with urllib.request.urlopen(FFMPEG_SUMS, timeout=60) as r:
+        for line in r.read().decode("utf-8", "replace").splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1].lstrip("*") == name:
+                return parts[0].lower()
+    die(f"{name} isn't listed in {FFMPEG_SUMS}; set UM_FFMPEG_SHA256, or point UM_FFMPEG_WIN at an ffmpeg you trust")
+
+
+def download_ffmpeg(z: Path):
+    """Download the ffmpeg zip to z and check its SHA-256 before anything is extracted."""
+    want = ffmpeg_sha256()
+    print("downloading", FFMPEG_URL)
+    urllib.request.urlretrieve(FFMPEG_URL, z)
+    h = hashlib.sha256()
+    with open(z, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    if h.hexdigest() != want:
+        z.unlink()
+        die(f"ffmpeg download failed its checksum (got {h.hexdigest()}, expected {want}); deleted it. The daily build may "
+            "have been replaced mid-download: run `um win setup` again. If it keeps failing, don't use this build.")
+    print("sha256 ok", want)
+
+
 def setup(args=None):
     _check_platform()
     d = local_appdata()
@@ -98,8 +136,7 @@ def setup(args=None):
         print("tool", tool_path(t))
     if not ffmpeg_win(required=False) or (args and args.force):
         z = d / "ffmpeg.zip"
-        print("downloading", FFMPEG_URL)
-        urllib.request.urlretrieve(FFMPEG_URL, z)
+        download_ffmpeg(z)
         with zipfile.ZipFile(z) as zf:
             root = zf.namelist()[0].split("/")[0]
             zf.extractall(d)
@@ -108,8 +145,10 @@ def setup(args=None):
         (d / root).rename(d / "ffmpeg")
         z.unlink()
     ff = ffmpeg_win()
-    out = subprocess.run([ff, "-hide_banner", "-h", "filter=gfxcapture"], capture_output=True, text=True).stdout
-    print("ffmpeg", ff, "(gfxcapture ok)" if "gfxcapture" in out else "(WARNING: no gfxcapture in this build)")
+    # Ask for the filter list and match the name as a word. `-h filter=gfxcapture` answers a build that lacks
+    # it with "Unknown filter 'gfxcapture'." *on stdout*, which contains the name and so read as a pass.
+    out = subprocess.run([ff, "-hide_banner", "-filters"], capture_output=True, **text_utf8()).stdout
+    print("ffmpeg", ff, "(gfxcapture ok)" if " gfxcapture " in out else "(WARNING: no gfxcapture in this build)")
     enc = pick_encoder(ff)
     (d / "config.json").write_text(json.dumps(dict(encoder=enc)))
     print("encoder", enc)
@@ -119,7 +158,7 @@ def pick_encoder(ff: str) -> str:
     """h264_nvenc / h264_amf / h264_qsv if the GPU takes a test frame, else libx264."""
     for enc in ("h264_nvenc", "h264_amf", "h264_qsv"):
         r = subprocess.run([ff, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=black:s=256x256:d=0.1", "-c:v", enc, "-f", "null", "-"],
-                           capture_output=True, text=True)
+                           capture_output=True, **text_utf8())
         if r.returncode == 0:
             return enc
     return "libx264"
@@ -153,7 +192,7 @@ def pid_of(name: str) -> int | None:
 
 def kill(pid: int):
     """By exact PID. (Pattern kills - pkill -f, taskkill /IM with wildcards - can hit the agent's own shell or other apps.)"""
-    r = subprocess.run(["taskkill.exe" if is_wsl() else "taskkill", "/PID", str(int(pid)), "/F"], capture_output=True, text=True)
+    r = subprocess.run(["taskkill.exe" if is_wsl() else "taskkill", "/PID", str(int(pid)), "/F"], capture_output=True, **text_console())
     print((r.stdout or r.stderr).strip())
 
 
@@ -163,7 +202,13 @@ def launch(target: str, args: list[str], steam: bool = False):
         subprocess.run(["cmd.exe" if is_wsl() else "cmd", "/c", "start", "", url], cwd="/mnt/c" if is_wsl() else None, timeout=30)
         return
     exe = to_win(target)
-    subprocess.run(["cmd.exe" if is_wsl() else "cmd", "/c", "start", "", exe, *args], cwd="/mnt/c" if is_wsl() else None, timeout=30)
+    # Start in the exe's own folder: games open their data files relative to the working directory
+    # (Tomb Raider: Legend dies with "Failed to open BIGFILE.000" when started from anywhere else).
+    exe_dir = ntpath.dirname(exe)
+    cmd = ["cmd.exe" if is_wsl() else "cmd", "/c", "start", ""]
+    if exe_dir:
+        cmd += ["/D", exe_dir]
+    subprocess.run([*cmd, exe, *args], cwd="/mnt/c" if is_wsl() else None, timeout=30)
 
 
 # --------------------------------------------------------------------------- capture
@@ -207,7 +252,7 @@ def _gpu_prefs() -> dict:
             pass
     elif is_wsl():
         try:
-            text = subprocess.run(["reg.exe", "query", "HKCU\\" + GPU_PREFS], capture_output=True, text=True, timeout=15, cwd="/mnt/c").stdout
+            text = subprocess.run(["reg.exe", "query", "HKCU\\" + GPU_PREFS], capture_output=True, timeout=15, cwd="/mnt/c", **text_utf8()).stdout
         except (OSError, subprocess.TimeoutExpired):
             return out
         for line in text.splitlines():
@@ -246,7 +291,7 @@ def shot(out: str, exe=None, hwnd=None, title=None, scale: float | None = None, 
     dst.parent.mkdir(parents=True, exist_ok=True)
     target = to_win(dst) if is_wsl() else str(dst)
     r = subprocess.run([ff, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", _source(exe, hwnd, title), "-frames:v", "1", target],
-                       capture_output=True, text=True, timeout=timeout)
+                       capture_output=True, timeout=timeout, **text_utf8())
     if r.returncode or not dst.exists():
         die(f"capture failed (is the window open and not minimized?): {r.stderr.strip()[-800:]}")
     if scale:
@@ -294,8 +339,8 @@ class Recorder:
             else:
                 self.audio = subprocess.Popen([ps_exe(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tool_path("ProcLoopback.ps1"),
                                                "-TargetPid", str(pid), "-Out", self.base + ".audio.raw"],
-                                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                              cwd="/mnt/c" if is_wsl() else None)
+                                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                              cwd="/mnt/c" if is_wsl() else None, **text_utf8())
                 self.header = json.loads(self.audio.stdout.readline() or "{}")
                 t_audio = time.time()
         self.t_video = time.time()
@@ -346,7 +391,7 @@ class Drive:
     def __init__(self, proc: str):
         _check_platform()
         self.p = subprocess.Popen([ps_exe(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tool_path("WinDrive.ps1"), "-Proc", proc],
-                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1, cwd="/mnt/c" if is_wsl() else None)
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=1, cwd="/mnt/c" if is_wsl() else None, **text_utf8())
         self.ready = self.p.stdout.readline().strip()
 
     def cmd(self, line: str, retry: bool = True) -> str:
@@ -410,7 +455,7 @@ def reg(action: str, key: str, value: str | None = None, data: str | None = None
         subprocess.run([exe, "export", key, to_win(bfile) if is_wsl() else str(bfile), "/y"], capture_output=True)
         print("backup:", bfile)
         cmd = [exe, "add", key, "/v", value, "/t", typ, "/d", data, "/f"]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, **text_console())
     print((r.stdout or r.stderr).replace("\r", "").strip())
 
 

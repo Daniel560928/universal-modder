@@ -2,7 +2,9 @@
 
     uv run --with pytest pytest -q
 """
+import io
 import json
+import os
 import shutil
 import struct
 import subprocess
@@ -65,19 +67,382 @@ def test_gamemaker_and_rpgmaker(tmp_path):
     assert engine_of(tmp_path / "b", {"www/js/rpg_core.js": "//", "Game.exe": b"MZ"})[0] == "rpgmaker-mvmz"
 
 
-def test_managed_pe(tmp_path):
-    # minimal PE32 with a CLR header directory entry
-    pe = bytearray(1024)
+def _pe(managed=True, arch=0x14C, pad=0):
+    # minimal PE (x86 PE32 by default, PE32+ for arch=0x8664), optionally with a CLR header
+    # directory entry, padded by `pad` bytes so tests can control file sizes
+    pe = bytearray(1024 + pad)
     pe[0:2] = b"MZ"
     struct.pack_into("<I", pe, 0x3C, 0x80)
     pe[0x80:0x84] = b"PE\0\0"
-    struct.pack_into("<H", pe, 0x84, 0x14C)
+    struct.pack_into("<H", pe, 0x84, arch)
     opt = 0x80 + 24
-    struct.pack_into("<H", pe, opt, 0x10B)
-    struct.pack_into("<I", pe, opt + 96 + 14 * 8, 0x2000)
+    struct.pack_into("<H", pe, opt, 0x20B if arch == 0x8664 else 0x10B)
+    if managed:
+        struct.pack_into("<I", pe, opt + (112 if arch == 0x8664 else 96) + 14 * 8, 0x2000)
+    return bytes(pe)
+
+
+def test_managed_pe(tmp_path):
     p = tmp_path / "Game.exe"
-    p.write_bytes(bytes(pe))
+    p.write_bytes(_pe())
     assert scan.pe_info(p) == {"arch": "x86", "managed": True}
+
+
+@pytest.mark.parametrize("bin_dir", ["Win64_Shipping_Client", "Gaming.Desktop.x64_Shipping_Client"])
+@pytest.mark.parametrize("name", ["Mount & Blade II Bannerlord", "RenamedGame"])
+def test_bannerlord_route_and_live_version(tmp_path, bin_dir, name):
+    # Identify the module layout even when the folder is renamed; don't send it to generic .NET/native loaders.
+    r = _named_game(tmp_path, name, {
+        f"bin/{bin_dir}/Bannerlord.exe": _pe(arch=0x8664),
+        f"bin/{bin_dir}/TaleWorlds.MountAndBlade.dll": _pe(arch=0x8664),
+        f"bin/{bin_dir}/Version.xml": '<Version><Singleplayer Value="v1.4.8"/></Version>',
+        "Modules/Native/SubModule.xml": '<Module><Id value="Native"/></Module>',
+    })
+    assert r["engine"]["key"] == "bannerlord" and r["engine"]["version"] == "v1.4.8"
+    assert r["engine"]["version_file"] == f"bin/{bin_dir.lower()}/version.xml"
+    assert r["routes"][0]["route"] == scan.BANNERLORD_ROUTE
+    assert r["playbook"].endswith("bannerlord.md") and "modules" in r["mod_folders"]
+    assert all(rt["playbook"] == "bannerlord.md" for rt in r["routes"])
+
+
+@pytest.mark.parametrize("version_xml", [
+    None, "<Version>", "<Version><Singleplayer/></Version>",
+    '<?xml version="1.0" encoding="not-real"?><Version><Singleplayer Value="v1.4.8"/></Version>',
+    '<?xml version="1.0" encoding="UTF-32"?><Version><Singleplayer Value="v1.4.8"/></Version>',
+])
+def test_bannerlord_missing_or_invalid_version(tmp_path, version_xml):
+    files = {
+        "bin/Win64_Shipping_Client/TaleWorlds.MountAndBlade.dll": _pe(arch=0x8664),
+        "Modules/Native/SubModule.xml": "<Module/>",
+    }
+    if version_xml is not None:
+        files["bin/Win64_Shipping_Client/Version.xml"] = version_xml
+    key, det = engine_of(tmp_path, files)
+    assert key == "bannerlord" and not det.get("version")
+
+
+@pytest.mark.parametrize("bin_dir", ["Win64_Shipping_Client", "Gaming.Desktop.x64_Shipping_Client"])
+def test_bannerlord_prefers_client_version_over_editor(tmp_path, bin_dir):
+    key, det = engine_of(tmp_path, {
+        f"bin/{bin_dir}/TaleWorlds.MountAndBlade.dll": _pe(),
+        f"bin/{bin_dir}/Version.xml": '<Version><Singleplayer Value="v1.5.4"/></Version>',
+        "bin/Win64_Shipping_wEditor/TaleWorlds.MountAndBlade.dll": _pe(),
+        "bin/Win64_Shipping_wEditor/Version.xml": '<Version><Singleplayer Value="v1.4.8"/></Version>',
+        "Modules/Native/SubModule.xml": "<Module/>",
+    })
+    assert key == "bannerlord" and det["version"] == "v1.5.4"
+
+
+@pytest.mark.parametrize("bin_dir", ["Win64_Shipping_Client", "Gaming.Desktop.x64_Shipping_Client"])
+def test_bannerlord_ignores_backup_binaries(tmp_path, bin_dir):
+    key, det = engine_of(tmp_path, {
+        f"bin/{bin_dir}/TaleWorlds.MountAndBlade.dll": _pe(),
+        f"bin/{bin_dir}/Version.xml": '<Version><Singleplayer Value="v1.4.8"/></Version>',
+        "bin/backup/Win64_Shipping_Client/TaleWorlds.MountAndBlade.dll": _pe(),
+        "bin/backup/Win64_Shipping_Client/Version.xml": '<Version><Singleplayer Value="v1.0.0"/></Version>',
+        "bin/backup/TaleWorlds.MountAndBlade.dll": _pe(),
+        "bin/backup/Version.xml": '<Version><Singleplayer Value="v1.0.0"/></Version>',
+        "bin/backup_Win64_Shipping_Client/TaleWorlds.MountAndBlade.dll": _pe(),
+        "bin/backup_Win64_Shipping_Client/Version.xml": '<Version><Singleplayer Value="v1.0.0"/></Version>',
+        "Modules/Native/SubModule.xml": "<Module/>",
+    })
+    assert key == "bannerlord" and det["version"] == "v1.4.8"
+    assert det["version_file"] == f"bin/{bin_dir.lower()}/version.xml"
+
+
+def test_copied_taleworlds_dll_is_not_a_bannerlord_install(tmp_path):
+    key, _ = engine_of(tmp_path, {
+        "Game.exe": _pe(),
+        "bin/Win64_Shipping_Client/TaleWorlds.MountAndBlade.dll": _pe(),
+    })
+    assert key == "dotnet"
+
+
+@pytest.mark.parametrize("bin_dir", ["backup", "backup_Win64_Shipping_Client", "Debug", "random"])
+def test_bannerlord_copies_do_not_override_another_engine(tmp_path, bin_dir):
+    key, _ = engine_of(tmp_path, {
+        "UnityPlayer.dll": _pe(False),
+        "Game_Data/Managed/Assembly-CSharp.dll": _pe(),
+        f"bin/{bin_dir}/TaleWorlds.MountAndBlade.dll": _pe(),
+        "Modules/Native/SubModule.xml": "<Module/>",
+    })
+    assert key == "unity-mono"
+
+
+def test_bannerlord_utf16_version(tmp_path):
+    key, det = engine_of(tmp_path, {
+        "bin/Win64_Shipping_Client/TaleWorlds.MountAndBlade.dll": _pe(),
+        "bin/Win64_Shipping_Client/Version.xml":
+            '<?xml version="1.0" encoding="UTF-16"?><Version><Singleplayer Value="v1.4.8"/></Version>'.encode("utf-16"),
+        "Modules/Native/SubModule.xml": "<Module/>",
+    })
+    assert key == "bannerlord" and det["version"] == "v1.4.8"
+
+
+def test_bannerlord_version_on_the_root_element(tmp_path):
+    # the other Version.xml shape builds have shipped: the Value sits on the root element
+    key, det = engine_of(tmp_path, {
+        "bin/Win64_Shipping_Client/TaleWorlds.MountAndBlade.dll": _pe(),
+        "bin/Win64_Shipping_Client/Version.xml": '<Version Value="v1.2.12"/>',
+        "Modules/Native/SubModule.xml": "<Module/>",
+    })
+    assert key == "bannerlord" and det["version"] == "v1.2.12"
+
+
+@pytest.mark.parametrize("name", ["Mount & Blade II: Bannerlord", "Mount & Blade II Bannerlord", "RenamedGame"])
+def test_bannerlord_save_folder_with_its_actual_name(tmp_path, monkeypatch, name):
+    # Steam uses '&', while the real Documents folder uses 'and'; a renamed install needs the same hint.
+    docs = tmp_path / "Documents"
+    saves = docs / "Mount and Blade II Bannerlord" / "Game Saves"
+    saves.mkdir(parents=True)
+    monkeypatch.setattr(scan, "win_folders", lambda: {"documents": str(docs)})
+    root = tmp_path / "install"
+    # A store title can contain ':' on Windows; keep it in metadata rather than the folder name.
+    monkeypatch.setattr(scan, "resolve_game", lambda query: dict(name=name, path=str(root)))
+    make(root, {
+        "bin/Win64_Shipping_Client/TaleWorlds.MountAndBlade.dll": _pe(),
+        "Modules/Native/SubModule.xml": "<Module/>",
+    })
+    r = scan.scan(str(root))
+    assert str(saves.parent) in r["saves"]
+
+
+def test_other_engines_do_not_report_a_generic_modules_folder_as_mods(tmp_path, monkeypatch):
+    monkeypatch.setattr(scan, "all_games", lambda: [])
+    r = _named_game(tmp_path, "OtherGame", {
+        "UnityPlayer.dll": _pe(False),
+        "Game_Data/Managed/Assembly-CSharp.dll": _pe(),
+        "Modules/Tool/helper.dll": _pe(),
+    })
+    assert "modules" not in r["mod_folders"]
+
+
+def test_zengin_detected(tmp_path):
+    key, _ = engine_of(tmp_path, {"system/Gothic2.exe": _pe(False), "Data/Textures.vdf": b"x"})
+    assert key == "zengin"
+    # volume layout alone (vdfs loader + Data/*.vdf) is enough
+    key, _ = engine_of(tmp_path / "b", {"system/vdfs32g.dll": _pe(False), "Data/Worlds.vdf": b"x"})
+    assert key == "zengin"
+
+
+@pytest.mark.parametrize("files", [
+    {"DDDA.exe": _pe(False), "nativePC/rom/game_main.arc": b"ARC\x00"},              # Dragon's Dogma: Dark Arisen
+    {"RE5DX9.exe": _pe(False), "nativePC_MT/Image/Archive/s506.arc": b"ARC\x00"},    # Resident Evil 5
+    {"DevilMayCry4SpecialEdition.exe": _pe(False), "nativeDX10/rom/player/costume.arc": b"ARC\x00"},
+    {"DeadRising.exe": _pe(False, arch=0x8664), "nativeWin64/rom/ui.arc": b"ARC\x00"},
+])
+def test_mt_framework_detected(tmp_path, files):
+    # the native* folder is named per port; the .arc archives under it are the signature
+    key, _ = engine_of(tmp_path, files)
+    assert key == "mt-framework"
+
+
+def test_re_engine_natives_is_not_mt_framework(tmp_path):
+    make(tmp_path, {"re2.exe": _pe(False, arch=0x8664), "re_chunk_000.pak": b"KPKA",
+                    "natives/STM/streaming/x.tex.10": b"x"})
+    hits, _ = scan.detect(scan.Index(tmp_path))
+    assert hits[0][0] == "re-engine" and all(k != "mt-framework" for k, *_ in hits)
+
+
+@pytest.mark.parametrize("files", [
+    # Unleashed Recompiled: the installer copies the raw Xbox 360 files into game/ (split .ar + .arl lists)
+    {"UnleashedRecomp.exe": _pe(False, arch=0x8664), "game/#ActD_Africa.ar.00": b"x", "game/#ActD_Africa.arl": b"x",
+     "update/default.xexp": b"x", "patched/default.xex": b"x"},
+    # Sonic Generations (Steam): the .ar archives live inside CRI .cpk packfiles, so only the exe tells
+    {"SonicGenerations.exe": _pe(False), "disk/bb.cpk": b"CPK "},
+    # Sonic Forces (HE2): the exe sits deep under build/
+    {"build/main/projects/exec/Sonic Forces.exe": _pe(False, arch=0x8664)},
+])
+def test_hedgehog_detected(tmp_path, files):
+    key, _ = engine_of(tmp_path, files)
+    assert key == "hedgehog"
+
+
+def test_lone_ar_archive_is_not_hedgehog(tmp_path):
+    make(tmp_path, {"Game.exe": _pe(False), "lib/libgame.ar": b"!<arch>\n"})
+    hits, _ = scan.detect(scan.Index(tmp_path))
+    assert all(k != "hedgehog" for k, *_ in hits)
+
+
+def test_blackrock_detected(tmp_path):
+    # Split/Second layout: .shaderinst + .model assets, .ark level packs
+    key, _ = engine_of(tmp_path, {"SplitSecond.exe": _pe(False),
+                                  "data/docks.ark": b"x",
+                                  "data/ve/car.model": b"x",
+                                  "data/ve/car.shaderinst": b"x"})
+    assert key == "blackrock"
+
+
+def test_nested_exe_fingerprinted(tmp_path):
+    # Gothic-style layout: the game exe lives one level down in system/
+    make(tmp_path, {"system/Gothic2.exe": _pe(managed=False), "Data/worlds.vdf": b"x"})
+    _, facts = scan.detect(scan.Index(tmp_path))
+    assert facts["executables"]["system/gothic2.exe"] == {"arch": "x86", "managed": False}
+
+
+def test_redist_exes_skipped(tmp_path):
+    # installer/runtime folders (Steam _CommonRedist, GOG __redist/__support, EA __installer) and
+    # uninstallers at any depth are not the game
+    make(tmp_path, {"Game.exe": _pe(False), "_CommonRedist/vcredist/vc_redist.exe": _pe(False),
+                    "__redist/dotnet/setup.exe": _pe(), "__support/app/helper.exe": _pe(),
+                    "__installer/Touchup.exe": _pe(), "system/unins000.exe": _pe(),
+                    "system/Gothic2.exe": _pe(False)})
+    _, facts = scan.detect(scan.Index(tmp_path))
+    assert list(facts["executables"]) == ["game.exe", "system/gothic2.exe"]
+    assert scan._in_skip_dir("__redist/x.jar") and scan._in_skip_dir("a/_commonredist/b/x.exe")
+    assert not scan._in_skip_dir("supporters/x.exe") and not scan._in_skip_dir("__redist.exe")
+
+
+def _named_game(tmp_path, name, files):
+    d = tmp_path / name
+    make(d, dict({f"f{i}.txt": "x" for i in range(6)}, **files))
+    return scan.scan(str(d))
+
+
+def test_zengin_route_only_for_classic_gothic(tmp_path):
+    # classic Gothic 1/2 get the ZenGin playbook from detection, with the exe-build check in the route
+    r = _named_game(tmp_path, "Gothic II", {"system/Gothic2.exe": _pe(False), "Data/Worlds.vdf": b"x"})
+    assert r["engine"]["key"] == "zengin" and r["playbook"].endswith("zengin.md")
+    assert "exe build" in r["routes"][0]["route"]
+    # Gothic 1 Remake (UE5) and Gothic III (Genome) contain "gothic 1"/"gothic ii" but aren't ZenGin
+    for name, files in (("Gothic 1 Remake", {"Gothic1Remake/Content/Paks/a.pak": b"x"}),
+                        ("Gothic III", {"Gothic3.exe": _pe(False), "Data/a.pak": b"x"})):
+        r = _named_game(tmp_path, name, files)
+        assert all(rt["playbook"] != "zengin.md" for rt in r["routes"]), name
+        assert not r["playbook"].endswith("zengin.md"), name
+
+
+def test_deep_tooling_jars_not_java_engine(tmp_path):
+    # a Ghidra/SDK tree inside the game folder must not mislabel a native game as Java
+    make(tmp_path, {"Game.exe": _pe(False),
+                    "Dev Folder/tools/thirdparty/ghidra/support/launchsupport.jar": b"x",
+                    "Dev Folder/tools/thirdparty/ghidra/gradle/gradle-wrapper.jar": b"x"})
+    hits, _ = scan.detect(scan.Index(tmp_path))
+    assert all(k != "java" for k, *_ in hits)
+    # but a jar where the game ships it (root / one level down) still detects
+    key, _ = engine_of(tmp_path / "b", {"game.jar": b"x", "jre/bin/java.exe": _pe(False)})
+    assert key == "java"
+
+
+def test_unicode_output_on_cp1252_console(tmp_path):
+    # `um kb show` must not UnicodeEncodeError when stdout isn't UTF-8
+    kb = tmp_path / "kb"
+    (kb / "games/x").mkdir(parents=True)
+    (kb / "games/x/n.md").write_text("---\ntitle: LÖVE → test\n---\n# LÖVE →\n", encoding="utf-8")
+    env = dict(os.environ, PYTHONIOENCODING="cp1252", UM_KB=str(kb),
+               PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+    r = subprocess.run([sys.executable, "-m", "um", "kb", "show", "n.md"],
+                       capture_output=True, encoding="utf-8", env=env)
+    assert r.returncode == 0 and "LÖVE →" in r.stdout
+
+
+def test_cli_prints_text_a_legacy_console_cannot_encode(tmp_path, monkeypatch):
+    # a Windows console defaults to cp1252, which has no "≥" or "→"; a note can hold anything
+    root = tmp_path / "knowledge" / "games" / "x"
+    root.mkdir(parents=True)
+    (root / "a.md").write_text("---\nkind: game\ntitle: Boon\ngame: X\n---\n# Boon\n\nThe boon pool ≥ 3 → cached\n",
+                               encoding="utf-8")
+    raw = io.BytesIO()
+    console = io.TextIOWrapper(raw, encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", console)
+    from um import cli
+    cli.main(["kb", "search", "boon", "--root", str(tmp_path / "knowledge")])
+    console.flush()
+    assert "The boon pool ≥ 3 → cached" in raw.getvalue().decode("utf-8")
+
+
+def test_tool_exe_does_not_set_dotnet_engine(tmp_path):
+    # Kenshi shape: the only managed binary is a tool (Forgotten Construction
+    # Set); the big game binary is native, so the engine must not be dotnet.
+    # The mod manager bundle is deliberately bigger than the game exe: size
+    # alone must not elect it as the game binary.
+    make(tmp_path, {
+        "kenshi_x64.exe": _pe(False, arch=0x8664, pad=40000),
+        "forgotten construction set.exe": _pe(),
+        "KenshiModTool.exe": _pe(False, arch=0x8664, pad=90000),
+        "OgreMain_x64.dll": b"MZ",
+        "Plugins_x64.cfg": "Plugin=RE_Kenshi",
+    })
+    hits, facts = scan.detect(scan.Index(tmp_path))
+    assert hits[0][0] == "native"
+    assert hits[0][2][0] == "kenshi_x64.exe"
+    assert facts["executables"]["kenshi_x64.exe"] == {"arch": "x64", "managed": False}
+
+
+def test_managed_game_exe_still_dotnet(tmp_path):
+    # guard: a game whose own binary is managed keeps the dotnet engine even
+    # when a tool-like launcher ships next to it
+    assert engine_of(tmp_path, {
+        "Game.exe": _pe(),
+        "GameLauncher.exe": _pe(),
+    })[0] == "dotnet"
+
+
+def test_dotnet_apphost_game_exe_still_dotnet(tmp_path):
+    # .NET 5+ shape: Game.exe is a native apphost next to Game.dll + Game.runtimeconfig.json,
+    # so a small managed launcher must not demote the game to native
+    key, _ = engine_of(tmp_path, {
+        "Game.exe": _pe(False, arch=0x8664, pad=40000),
+        "Game.dll": _pe(arch=0x8664),
+        "Game.runtimeconfig.json": "{}",
+        "Launcher.exe": _pe(),
+    })
+    assert key == "dotnet"
+
+
+def test_tool_like_native_exe_never_game_binary(tmp_path):
+    # when every native exe is tool-like there is no game binary to prefer: stay dotnet
+    # rather than electing setup.exe
+    make(tmp_path, {"Editor.exe": _pe(), "setup.exe": _pe(False, pad=40000)})
+    hits, _ = scan.detect(scan.Index(tmp_path))
+    assert hits[0][0] == "dotnet"
+    assert all("setup.exe" not in ev for _, _, ev, _ in hits)
+
+
+def test_kenshi_loaders_and_route(tmp_path):
+    d = tmp_path / "Kenshi"
+    make(d, {
+        "kenshi_x64.exe": _pe(False, arch=0x8664, pad=40000),
+        "forgotten construction set.exe": _pe(),
+        "OgreMain_x64.dll": b"MZ",
+        "RE_Kenshi.dll": b"MZ", "KenshiLib.dll": b"MZ",
+        "KenshiModTool.exe": _pe(False, arch=0x8664, pad=100),
+        "mods/readme.txt": "x",
+    })
+    r = scan.scan(str(d))
+    assert r["engine"]["key"] == "native"
+    assert "RE_Kenshi (Kenshi OGRE plugin)" in r["mod_loaders_installed"]
+    assert "Kenshi Mod Manager" in r["mod_loaders_installed"]
+    assert r["routes"][0]["why"] == "known game" and r["routes"][0]["playbook"] == "native.md"
+    # a generic root masterlist.json is not a Kenshi Mod Manager install
+    make(tmp_path / "Other", {"Game.exe": _pe(False), "masterlist.json": "[]"})
+    assert "Kenshi Mod Manager" not in scan.scan(str(tmp_path / "Other"))["mod_loaders_installed"]
+
+
+@pytest.mark.parametrize("name", ["Dwarf Fortress", "df_53_16"])
+def test_dwarf_fortress_route_and_dfhack(tmp_path, name):
+    # DF is native with no engine signature: the raws route must outrank the proxy-DLL one, also in a renamed folder
+    r = _named_game(tmp_path, name, {"dwarfort": b"\x7fELF", "data/vanilla/vanilla_creatures_graphics/info.txt": "[ID:x]",
+                                     "libdfhooks_dfhack.so": b"\x7fELF"})
+    assert r["routes"][0]["route"] == scan.KNOWN["dwarf fortress"][0] and r["routes"][0]["why"] == "known game"
+    assert "DFHack" in r["mod_loaders_installed"]
+
+
+@pytest.mark.parametrize("name", ["Mindustry", "mdt"])
+def test_mindustry_route(tmp_path, name):
+    # the packaged game (Mindustry.exe + jre/desktop.jar) scans as Java; its own mod API comes first, not jar patching
+    r = _named_game(tmp_path, name, {"Mindustry.exe": _pe(False), "Mindustry.json": "{}", "jre/desktop.jar": b"PK"})
+    assert r["engine"]["key"] == "java"
+    assert r["routes"][0]["route"] == scan.KNOWN["mindustry"][0] and "mod.hjson" in r["routes"][0]["route"]
+    assert all(rt["route"] != scan.ENGINES["java"][2] for rt in r["routes"])
+
+
+@pytest.mark.parametrize("name", ["The Binding of Isaac Rebirth", "isaac"])
+def test_isaac_route(tmp_path, name):
+    # the Steam folder has no colon, so the Lua route must come from isaac-ng.exe, ahead of the native proxy-DLL one
+    r = _named_game(tmp_path, name, {"isaac-ng.exe": _pe(False), "resources/packed/graphics.a": b"x"})
+    assert r["routes"][0]["route"] == scan.KNOWN["the binding of isaac: rebirth"][0]
+    assert r["routes"][0]["playbook"] == "isaac.md" and r["routes"][0]["why"] == "known game"
 
 
 def test_vdf():
@@ -178,6 +543,149 @@ def test_slay_the_spire_2_is_not_sts1(tmp_path):
         (d / f"f{i}.txt").write_text("x")
     route = scan.scan(str(d))["routes"][0]["route"]
     assert route == scan.KNOWN["slay the spire 2"][0] and "ModTheSpire" not in route
+
+
+def test_online_only_matches_whole_names():
+    # a substring test told agents to stop on single-player games: Rusty Lake ("rust"), Battlefield 1942, MW2 (2009)
+    for offline in ["Rusty Lake Paradise", "Rusted Warfare", "Battlefield 1942", "Call of Duty: Modern Warfare 2 (2009)",
+                    "Deadlock: Planetary Conquest", "The Final Station", "Trusty Rusty"]:
+        assert scan.online_only(offline) is None, offline
+    for online in ["Rust", "Counter-Strike 2", "Call of Duty®", "Tom Clancy's Rainbow Six® Siege", "PUBG: BATTLEGROUNDS",
+                   "Overwatch® 2", "Deadlock", "NARAKA: BLADEPOINT"]:
+        assert scan.online_only(online), online
+
+
+def test_scan_warns_only_for_online_games(tmp_path):
+    for name, warned in [("Rust", True), ("Rusty Lake Paradise", False)]:
+        d = tmp_path / name
+        d.mkdir()
+        for i in range(6):
+            (d / f"f{i}.txt").write_text("x")
+        assert any("online competitive" in w for w in scan.scan(str(d))["warnings"]) == warned, name
+
+
+def _fake_host(monkeypatch, os_name, machine, wsl=False):
+    import platform
+    monkeypatch.setattr(scan, "is_mac", lambda: os_name == "macos")
+    monkeypatch.setattr(scan, "is_windows", lambda: os_name == "windows")
+    monkeypatch.setattr(scan, "is_wsl", lambda: wsl)
+    monkeypatch.setattr(platform, "machine", lambda: machine)
+
+
+def test_host_info_names_the_cpu_like_the_exes(monkeypatch):
+    # the host's `arch` must compare directly with an exe's `arch` in the report (x86, x64, arm64)
+    for machine, arch in [("x86_64", "x64"), ("AMD64", "x64"), ("arm64", "arm64"), ("aarch64", "arm64"),
+                          ("i386", "x86"), ("i686", "x86"), ("riscv64", "riscv64")]:
+        _fake_host(monkeypatch, "linux", machine)
+        assert scan.host_info()["arch"] == arch, machine
+
+
+def test_host_info_per_os_and_wsl(monkeypatch):
+    import platform
+    _fake_host(monkeypatch, "macos", "arm64")
+    monkeypatch.setattr(platform, "mac_ver", lambda: ("26.5.1", ("", "", ""), "arm64"))
+    h = scan.host_info()
+    assert h == dict(os="macos", os_version="26.5.1", arch="arm64", wsl=False, translated=False)
+    assert scan.host_line(h) == "macOS 26.5.1, arm64"
+
+    _fake_host(monkeypatch, "windows", "AMD64")
+    monkeypatch.setattr(platform, "version", lambda: "10.0.26100")
+    h = scan.host_info()
+    assert (h["os"], h["arch"], h["wsl"]) == ("windows", "x64", False)
+    assert scan.host_line(h) == "Windows 10.0.26100, x64"
+
+    _fake_host(monkeypatch, "linux", "x86_64")
+    monkeypatch.setattr(platform, "freedesktop_os_release", lambda: {"PRETTY_NAME": "Ubuntu 24.04.1 LTS"})
+    assert scan.host_line(scan.host_info()) == "Ubuntu 24.04.1 LTS, x64"
+    monkeypatch.setattr(platform, "freedesktop_os_release", lambda: (_ for _ in ()).throw(OSError("no os-release")))
+    monkeypatch.setattr(platform, "release", lambda: "6.8.0")
+    assert scan.host_line(scan.host_info()) == "Linux 6.8.0, x64"
+
+    # WSL is Linux to Python but a Windows host for games: the line must say so, and never suggest Proton territory
+    _fake_host(monkeypatch, "linux", "x86_64", wsl=True)
+    monkeypatch.setattr(platform, "freedesktop_os_release", lambda: {"PRETTY_NAME": "Ubuntu 22.04.5 LTS"})
+    h = scan.host_info()
+    assert h["wsl"] is True and scan.host_line(h) == "Windows via WSL (Ubuntu 22.04.5 LTS), x64"
+
+
+def test_host_info_sees_through_rosetta(monkeypatch):
+    import platform
+    import subprocess
+    monkeypatch.setattr(platform, "mac_ver", lambda: ("26.5.1", ("", "", ""), "x86_64"))
+
+    def sysctl(out=None, error=None):
+        def run(*a, **k):
+            if error:
+                raise error
+            return subprocess.CompletedProcess(a, 0, stdout=out, stderr="")
+        return run
+
+    _fake_host(monkeypatch, "macos", "x86_64")
+    monkeypatch.setattr(scan.subprocess, "run", sysctl("1\n"))
+    h = scan.host_info()                      # x86_64 Python translated on an Apple Silicon Mac
+    assert h["arch"] == "arm64" and h["translated"] is True
+    assert scan.host_line(h) == "macOS 26.5.1, arm64 (Python runs under Rosetta)"
+    for out, error in [("0\n", None), ("", None), (None, OSError("no sysctl"))]:   # a real Intel Mac, or no answer
+        monkeypatch.setattr(scan.subprocess, "run", sysctl(out, error))
+        h = scan.host_info()
+        assert h["arch"] == "x64" and h["translated"] is False
+
+
+def test_scan_report_starts_with_the_host(tmp_path):
+    d = tmp_path / "Some Game"
+    d.mkdir()
+    for i in range(6):
+        (d / f"f{i}.txt").write_text("x")
+    r = scan.scan(str(d))
+    assert set(r["host"]) == {"os", "os_version", "arch", "wsl", "translated"}   # the same keys on every host
+    assert json.loads(json.dumps(r))["host"] == r["host"]           # machine-readable for agents
+    lines = scan.format_report(r).splitlines()
+    assert lines[1].startswith("  path:") and lines[2].startswith("  host:      ")
+
+
+def test_scan_warns_when_windows_exes_meet_a_non_windows_host(tmp_path, monkeypatch):
+    def folder(name, exe):
+        d = tmp_path / name
+        d.mkdir()
+        for i in range(6):
+            (d / f"f{i}.txt").write_text("x")
+        (d / "game.exe" if exe else d / "game.x86_64").write_bytes(_pe(managed=False, arch=0x8664) if exe else b"\x7fELF")
+        return d
+
+    def host(os_name, wsl=False):
+        return dict(os=os_name, os_version="1.2", arch="arm64", wsl=wsl, translated=False)
+
+    def warning(h, d):
+        monkeypatch.setattr(scan, "host_info", lambda: h)
+        return next((w for w in scan.scan(str(d))["warnings"] if "not native" in w), None)
+
+    pe, native = folder("Windows build", True), folder("Native build", False)
+    for h in (host("macos"), host("linux")):
+        w = warning(h, pe)
+        assert w and scan.host_line(h) in w and "compatibility.md" in w, h       # one line, naming the host and where to read
+        assert "\n" not in w
+    assert warning(host("windows"), pe) is None
+    assert warning(host("linux", wsl=True), pe) is None                          # WSL counts as Windows
+    assert warning(host("macos"), native) is None                                # no PE exes: no claim
+
+
+def test_ffmpeg_download_is_checksummed(tmp_path, monkeypatch):
+    import hashlib, io
+    from um import win
+    payload = b"PK fake ffmpeg zip"
+    good = hashlib.sha256(payload).hexdigest()
+    sums = f"{'0' * 64}  ffmpeg-other.zip\n{good}  ffmpeg-master-latest-win64-gpl.zip\n".encode()
+    monkeypatch.delenv("UM_FFMPEG_SHA256", raising=False)
+    monkeypatch.setattr(win.urllib.request, "urlopen", lambda url, timeout=None: io.BytesIO(sums))
+    assert win.ffmpeg_sha256() == good
+    monkeypatch.setattr(win.urllib.request, "urlretrieve", lambda url, dst: Path(dst).write_bytes(payload))
+    z = tmp_path / "ffmpeg.zip"
+    win.download_ffmpeg(z)
+    assert z.read_bytes() == payload
+    monkeypatch.setenv("UM_FFMPEG_SHA256", "ab" * 32)        # a pin wins over the published sum
+    with pytest.raises(SystemExit):
+        win.download_ffmpeg(z)
+    assert not z.exists()                                      # a bad download is deleted, never extracted
 
 
 # --------------------------------------------------------------------------- sprite
@@ -331,6 +839,17 @@ def test_publish_check(tmp_path, capsys):
     assert "decompiler header x1 in src/Mod.cs" in normalized and "README.md" not in normalized.split("decompiler header")[-1].split("\n")[0]
 
 
+def test_publish_check_mod_inside_game(tmp_path, capsys):
+    # a Dwarf Fortress mod in <install>/mods/<name> matched itself: every file "game file copied verbatim"
+    game, mod = tmp_path / "game", tmp_path / "game" / "mods" / "mine"
+    make(game, {"data/big.bin": b"x" * 4096, "mods/mine/README.md": "My mod", "mods/mine/graphics/page.png": b"y" * 4096})
+    assert publish.check(str(mod), str(game)) == 0
+    (mod / "copied.bin").write_bytes(b"x" * 4096)
+    assert publish.check(str(mod), str(game)) == 1
+    out = capsys.readouterr().out
+    assert "copied.bin" in out and "page.png" not in out
+
+
 @pytest.mark.parametrize("label,key", [
     # assembled at runtime so this file doesn't trip the toolkit's own publish check
     ("OpenAI key", "sk-" + "proj-" + "Ab3_dE-f" + "Gh1jK2lM3nO4pQ5rS6tU7vW8xY9z0" * 4),
@@ -338,6 +857,7 @@ def test_publish_check(tmp_path, capsys):
     ("OpenAI key", "sk-" + "Gh1jK2lM3nO4pQ5rS6tU7vW8xY9z0" * 2),
     ("GitHub token", "github" + "_pat_" + "11ABCDEFG0123456789abc" + "_" + "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5bC7dE9fG1hJ3kL5mN7pQ9rS1t"),
     ("GitHub token", "gh" + "p_" + "aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3z"),
+    ("Sprixen key", "spx_" + "live_" + "Gh1jK2lM3nO4pQ5rS6tU7vW8xY9z0" * 2),
 ])
 def test_secret_patterns_catch_current_key_formats(label, key):
     rx = dict(publish.SECRET_PATTERNS)[label]
@@ -345,8 +865,20 @@ def test_secret_patterns_catch_current_key_formats(label, key):
 
 
 def test_secret_patterns_ignore_ordinary_text():
-    text = "sk-learn-style-kebab-case-identifiers-are-not-keys and github_pat_ alone"
+    text = "sk-" + "learn-style-kebab-case-identifiers-are-not-keys and github_pat_ alone"
     assert not [label for label, rx in publish.SECRET_PATTERNS if rx.search(text)]
+
+
+def test_video_theme_font_override(tmp_path):
+    # Space Grotesk is Latin-only: an EDL theme's title_font replaces it, e.g. for Cyrillic titles
+    video.FONT_OVERRIDES[video.TITLE_FONT] = str(video.MONO_FONT)
+    try:
+        assert video._font(video.TITLE_FONT, 20).path == str(video.MONO_FONT)
+        video.hook_text("Привет, мир", 640, 360, {}, tmp_path / "hook.png")
+        assert (tmp_path / "hook.png").exists()
+    finally:
+        video.FONT_OVERRIDES.clear()
+    assert video._font(video.TITLE_FONT, 20).path == str(video.TITLE_FONT)
 
 
 # --------------------------------------------------------------------------- video
@@ -364,6 +896,46 @@ def test_compile_small_edl(tmp_path):
     video.compile_edl(tmp_path / "edl.json", str(tmp_path / "out.mp4"))
     info = video.probe(tmp_path / "out.mp4")
     assert abs(info["duration"] - (2 + 2 + 1.5)) < 0.15 and info["audio"]
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+def test_compile_preview_keeps_size_even(tmp_path):
+    # 4:5 portrait: half of 1080x1350 is 540x675, and libx264 refuses an odd height in yuv420p
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=1080x1350:d=2:r=30", "-f", "lavfi", "-i", "sine=f=440:d=2",
+                    "-shortest", str(tmp_path / "c.mp4")], check=True)
+    edl = {"size": [1080, 1350], "fps": 30, "segments": [{"clip": "c.mp4", "dur": 1.0}, {"card": {"title": "The end"}, "dur": 1.0}]}
+    (tmp_path / "edl.json").write_text(json.dumps(edl))
+    video.compile_edl(tmp_path / "edl.json", str(tmp_path / "out.mp4"), preview=True)
+    info = video.probe(tmp_path / "out.mp4")
+    assert (info["width"], info["height"]) == (540, 674)
+
+    (tmp_path / "edl.json").write_text(json.dumps(dict(edl, size=[1080, 1351])))
+    with pytest.raises(SystemExit):
+        video.compile_edl(tmp_path / "edl.json", str(tmp_path / "odd.mp4"))
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
+def test_compile_cut_then_fade(tmp_path, monkeypatch):
+    # a cut then a fade: xfade's first input is concat's output (AVTB), so every join input must end at AVTB.
+    # FFmpeg 7.0/7.1's setpts marks the frame rate unknown (1/0), which xfade refuses, so each join input also
+    # declares fps=. Newer FFmpeg passes without it, hence the graph check.
+    calls, real_ff = [], video.ff
+
+    def spy(*args, **kw):
+        calls.append([str(a) for a in args])
+        return real_ff(*args, **kw)
+
+    monkeypatch.setattr(video, "ff", spy)
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=640x360:d=2:r=24", "-f", "lavfi", "-i", "sine=f=440:d=2",
+                    "-shortest", str(tmp_path / "c.mp4")], check=True)
+    edl = {"size": [640, 360], "fps": 24, "transition": {"type": "cut"},
+           "segments": [{"clip": "c.mp4", "dur": 1.0}, {"clip": "c.mp4", "in": 0.5, "dur": 1.0},
+                        {"card": {"title": "The end"}, "dur": 1.0, "transition": {"type": "fade", "duration": 0.25}}]}
+    (tmp_path / "edl.json").write_text(json.dumps(edl))
+    video.compile_edl(tmp_path / "edl.json", str(tmp_path / "out.mp4"))
+    graph = calls[-1][calls[-1].index("-filter_complex") + 1].split(";")
+    assert all(any(g.startswith(f"[{k}:v]") and "fps=24" in g for g in graph) for k in range(3))
+    assert abs(video.probe(tmp_path / "out.mp4")["duration"] - (1 + 1 + 1 - 0.25)) < 0.15
 
 
 # --------------------------------------------------------------------------- knowledge base
@@ -405,6 +977,41 @@ def test_kb_new_check_search(tmp_path):
     assert kb.search(root, ["boon"], route="native-hook") == []
 
 
+def test_kb_search_matches_word_starts(tmp_path):
+    root = tmp_path / "knowledge" / "games" / "x"
+    root.mkdir(parents=True)
+    for name, title in [("a.md", "Trust and frustum culling"), ("b.md", "A Rust server plugin"), ("c.md", "Rusty Lake puzzles"),
+                        ("d.md", "Patching plugin.esp")]:
+        (root / name).write_text(f"---\nkind: game\ntitle: {title}\ngame: X\n---\n# {title}\n", encoding="utf-8")
+    found = {r["title"] for r in kb.search(tmp_path / "knowledge", ["rust"])}
+    assert found == {"A Rust server plugin", "Rusty Lake puzzles"}
+    assert [r["title"] for r in kb.search(tmp_path / "knowledge", [".esp"])] == ["Patching plugin.esp"]   # punctuation-led terms match anywhere
+
+
+def test_kb_check_warns_on_links_to_missing_notes(tmp_path):
+    root = tmp_path / "knowledge"
+    (root / "techniques").mkdir(parents=True)
+    (root / "games" / "x").mkdir(parents=True)
+    (root / "games" / "x" / "real.md").write_text("---\nkind: game\ntitle: Real\ngame: X\n---\n# Real\n", encoding="utf-8")
+    note = root / "techniques" / "t.md"
+    head = "---\nkind: technique\ntitle: t\ntags: [x]\ndate: 2026-10-10\nagents: [a]\n---\n# t\n"
+    note.write_text(head + "See [real](../games/x/real.md), [its setup](../games/x/real.md#setup), "
+                    "[a doc](https://example.com/docs/gone.md), `games/x/real.md` and `knowledge/games/x/real.md`.\n",
+                    encoding="utf-8")
+    _, warns = kb.check_note(note, root)
+    assert not [w for w in warns if "does not exist" in w]
+    note.write_text(head + "See [gone](../games/x/gone.md), [gone too](../games/x/gone.md#setup), "
+                    "[root-relative](games/x/real.md) and `techniques/missing.md`.\n", encoding="utf-8")
+    _, warns = kb.check_note(note, root)
+    assert sum("does not exist" in w for w in warns) == 4
+    # a note linking to the note next to it
+    sib = root / "games" / "x" / "sib.md"
+    sib.write_text(head + "Next to [real](real.md) and [gone](./gone.md).\n", encoding="utf-8")
+    _, warns = kb.check_note(sib, root)
+    assert [w for w in warns if "does not exist" in w] == [
+        "link to a note that does not exist: ./gone.md (links are relative to this note's folder)"]
+
+
 def test_kb_check_rejects_secrets_and_dumps(tmp_path):
     note = tmp_path / "n.md"
     code = "\n".join(f"int x{i} = {i};" for i in range(160))
@@ -412,6 +1019,16 @@ def test_kb_check_rejects_secrets_and_dumps(tmp_path):
                     f"```c\n{code}\n```\n" + "FAL" + "_KEY=abcdefghijklmnopqrstuvwxyz0123\n")
     fails, _ = kb.check_note(note)
     assert any("code block" in f for f in fails) and any("FAL_KEY" in f for f in fails)
+
+
+def test_kb_without_pyyaml_says_what_to_install(tmp_path, monkeypatch, capsys):
+    # run from a clone without `pip install -e .`: a hint, not a ModuleNotFoundError traceback
+    note = tmp_path / "n.md"
+    note.write_text("---\ntitle: t\n---\n# t\n", encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    with pytest.raises(SystemExit):
+        kb.parse(note)
+    assert "pip install pyyaml" in capsys.readouterr().err
 
 
 def test_kb_impossible_date_is_reported_not_raised(tmp_path):
@@ -426,7 +1043,28 @@ def test_kb_impossible_date_is_reported_not_raised(tmp_path):
     kb.build_index(root)
 
 
-@pytest.mark.parametrize("url", ["https://github.com/alice/universal-modder.git", "https://github.com/alice/universal-modder",
+def test_kb_check_rejects_unquoted_list_items(tmp_path):
+    # YAML reads `[Cataclysm: Dark Days Ahead]` as a dict and `2004` as an int, and splits `Python (a, b)` on the comma;
+    # the dict reached the index as "{'Cataclysm': ...}" and `kb search --game` crashed on .lower()
+    root = tmp_path / "knowledge"
+    (root / "games" / "x").mkdir(parents=True)
+    note = root / "games" / "x" / "n.md"
+    front = "kind: game\ntitle: t\ngame: Project Zomboid\ngames_also: [Cataclysm: Dark Days Ahead]\ntools: [Python 3.12 (a, b), grep]\ntags: [rts, 2004]\n"
+    note.write_text(f"---\n{front}---\n# t\n", encoding="utf-8")
+    fails, _ = kb.check_note(note, root)
+    for key in ("games_also", "tools", "tags"):
+        assert any(f.startswith(key) and "quote" in f for f in fails), (key, fails)
+    assert [r["path"] for r in kb.search(root, [], game="cataclysm")] == ["games/x/n.md"]
+    assert kb.search(root, ["python"], game="zomboid")
+    kb.build_index(root)
+    for bare in ("Cataclysm: Dark Days Ahead", "Python 3.12 (a, b)", "2004"):
+        front = front.replace(bare, f'"{bare}"')
+    note.write_text(f"---\n{front}---\n# t\n", encoding="utf-8")
+    fails, _ = kb.check_note(note, root)
+    assert not [f for f in fails if f.startswith(("games_also", "tools", "tags"))], fails
+
+
+@pytest.mark.parametrize("url", ["https://github.com/alice/universal-modder.git","https://github.com/alice/universal-modder",
                                  "git@github.com:alice/universal-modder.git", "ssh://git@github.com/alice/universal-modder.git"])
 def test_pr_head_from_fork(url):
     # gh looks a bare --head branch up in the base repo; a PR from a fork needs "<owner>:<branch>"
@@ -453,7 +1091,104 @@ def test_ps_exe_falls_back_to_full_path(tmp_path, monkeypatch):
     assert common.ps_exe() == "/on/path/powershell"
 
 
+def test_run_timeout_exits_with_a_message(capsys):
+    # a command that outlives timeout= ends in die(), like a failed one, not a TimeoutExpired traceback
+    from um import common
+    with pytest.raises(SystemExit):
+        common.run([sys.executable, "-c", "import time; time.sleep(10)"], timeout=0.2)
+    assert "timed out after 0.2s" in capsys.readouterr().err
+
+
 # --------------------------------------------------------------------------- backup
+
+@pytest.fixture
+def backup_same_second(tmp_path, monkeypatch):
+    monkeypatch.setattr(backup, "data_dir", lambda: tmp_path / "data")
+    monkeypatch.setattr(backup.time, "strftime", lambda *args: "20261006-120000")
+
+
+def test_backup_same_second_keeps_every_snapshot(tmp_path, backup_same_second):
+    src = tmp_path / "src"
+    paths = []
+    for i in range(12):
+        make(src, {"save.dat": f"version {i}"})
+        paths.append(backup.create(str(src), name="t", note=f"take {i}"))
+
+    assert len(set(paths)) == 12
+    assert paths[0].name == "20261006-120000.zip"  # keep the existing filename format when available
+    assert backup.snapshots("t") == paths         # latest selection still works after ten collisions
+    for i, path in enumerate(paths):
+        with backup.zipfile.ZipFile(path) as z:
+            assert z.read("save.dat") == f"version {i}".encode()
+        assert backup._manifest(path)["note"] == f"take {i}"
+    assert backup.diff("t")["changed"] == []
+    make(src, {"save.dat": "modified"})
+    backup.restore("t", yes=True)
+    assert (src / "save.dat").read_text() == "version 11"
+
+
+@pytest.mark.parametrize("removed", [0, 1])
+def test_backup_after_deleted_snapshot_is_still_latest(tmp_path, backup_same_second, removed):
+    src = tmp_path / "src"
+    make(src, {"save.dat": "old"})
+    paths = [backup.create(str(src), name="t") for _ in range(3)]
+    paths[removed].unlink()
+    make(src, {"save.dat": "new"})
+    newest = backup.create(str(src), name="t")
+
+    assert newest > paths[-1]
+    assert backup.snapshots("t")[-1] == newest
+    assert backup.diff("t")["changed"] == []
+
+
+def test_backup_concurrent_creates_keep_every_snapshot(tmp_path, backup_same_second):
+    from concurrent.futures import ThreadPoolExecutor
+
+    src = tmp_path / "src"
+    make(src, {"save.dat": "world"})
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        paths = list(pool.map(lambda i: backup.create(str(src), name="t", note=str(i)), range(8)))
+
+    assert len(set(paths)) == 8
+    assert backup.snapshots("t") == sorted(paths)
+    for i, path in enumerate(paths):
+        with backup.zipfile.ZipFile(path) as z:
+            assert z.read("save.dat") == b"world"
+        assert backup._manifest(path)["note"] == str(i)
+
+
+@pytest.mark.parametrize("error", [OSError, KeyboardInterrupt])
+def test_backup_failed_create_keeps_previous_snapshot(tmp_path, backup_same_second, monkeypatch, error):
+    src = tmp_path / "src"
+    make(src, {"save.dat": "pristine"})
+    first = backup.create(str(src), name="t")
+    original = first.read_bytes()
+
+    def fail_write(*args, **kwargs):
+        raise error("interrupted backup")
+
+    monkeypatch.setattr(backup.zipfile.ZipFile, "write", fail_write)
+    with pytest.raises(error, match="interrupted backup"):
+        backup.create(str(src), name="t")
+    assert backup.snapshots("t") == [first]
+    assert first.read_bytes() == original
+
+
+def test_backup_repeated_restores_keep_undo_snapshots(tmp_path, backup_same_second):
+    src = tmp_path / "src"
+    make(src, {"save.dat": "pristine"})
+    backup.create(str(src), name="t")
+    for state in ("first take", "second take"):
+        make(src, {"save.dat": state})
+        backup.restore("t", yes=True)
+        assert (src / "save.dat").read_text() == "pristine"
+
+    undo = backup.snapshots("t-pre-restore")
+    assert len(undo) == 2
+    for path, state in zip(undo, ("first take", "second take")):
+        with backup.zipfile.ZipFile(path) as z:
+            assert z.read("save.dat") == state.encode()
+
 
 def test_backup_handles_pre_1980_timestamps(tmp_path, monkeypatch):
     import os
