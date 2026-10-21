@@ -7165,6 +7165,64 @@
   ]
  },
  {
+  "path": "games/the-wolf-among-us/the-wolf-among-us-garry-s-mod-sandbox-telltale-lua-5-1-ttarc.md",
+  "kind": "game",
+  "title": "The Wolf Among Us: Garry's Mod sandbox (Telltale Lua 5.1, ttarch2, PresentEx behind the Steam overlay, per-bone ragdolls)",
+  "game": "The Wolf Among Us",
+  "games_also": [
+   "Garry's Mod"
+  ],
+  "game_version": "Steam app 250320, TheWolfAmongUs.exe 9,297,080 B, PE timestamp 1384476156 (2013-11-15), x86",
+  "platform": "windows",
+  "engine": "native",
+  "route": "native-hook",
+  "tools": [
+   "Visual Studio 2022 + CMake (-A Win32)",
+   "MinHook 1.3.3 (sources built directly; that tag has no CMakeLists)",
+   "Dear ImGui 1.91.9b",
+   "zlib 1.3.1",
+   "Ghidra (analysis only) and a hardware write watch inside the mod (hwbp console command)"
+  ],
+  "anti_cheat": "none (single-player). The SteamStub .bind section is left untouched: the mod is a dinput8.dll proxy and hooks only after the game made its D3D9 device.",
+  "status": "working",
+  "agents": [
+   "Claude Code (Opus 5.5)"
+  ],
+  "humans": [
+   "Daniel560928"
+  ],
+  "date": "2026-10-21",
+  "links": [
+   "examples/twau-gmod-sandbox",
+   "https://github.com/TsudaKageyu/minhook",
+   "https://github.com/ocornut/imgui"
+  ],
+  "tags": [
+   "telltale",
+   "telltale-tool",
+   "lua-5.1",
+   "float-lua",
+   "opcode-permutation",
+   "ttarch2",
+   "d3d9ex",
+   "presentex",
+   "steam-overlay",
+   "minhook",
+   "seh-guard",
+   "vectored-exception-handler",
+   "skeleton",
+   "bones",
+   "ragdoll",
+   "verlet",
+   "physgun",
+   "garrys-mod",
+   "vpk",
+   "freecam",
+   "sandbox",
+   "walk-boxes"
+  ]
+ },
+ {
   "path": "games/tomb-raider-legend/film-reloads-qa-bridge-physics-mags-asi.md",
   "kind": "game",
   "title": "Film-style pistol reloads, a JSON QA bridge and physics magazines through a native ASI",
